@@ -1,4 +1,4 @@
-"""Lap data parsing and processing logic."""
+"""parser.py"""
 import math
 import pathlib
 from dataclasses import dataclass
