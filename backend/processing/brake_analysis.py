@@ -44,7 +44,7 @@ import numpy as np
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import find_peaks
 
-from parser import LapDataParser, _arc_length
+from parser import LapDataParser, _arc_length, align_laps
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +450,13 @@ def plot_brake_analysis(
     ref_steer  = _get_channel(ref_states,  "steering")
     slow_steer = _get_channel(slow_states, "steering")
 
+    # Sort slow-lap data by mapped x-coordinate to prevent vertical spikes
+    slow_order = np.argsort(slow_arc, kind="stable")
+    slow_arc_sorted = slow_arc[slow_order]
+    slow_brake_norm_sorted = slow_brake_norm[slow_order]
+    slow_speed_sorted = slow_speed[slow_order]
+    slow_steer_sorted = slow_steer[slow_order]
+
     fig, (ax_brake, ax_speed, ax_steer) = plt.subplots(
         3, 1, figsize=(18, 12), sharex=False
     )
@@ -461,7 +468,7 @@ def plot_brake_analysis(
     # ── 1. Brake pressure ────────────────────────────────────────────────────
     ax_brake.plot(ref_arc,  ref_brake_norm,  color="#2980b9", lw=1.4,
                   label="Reference", zorder=3)
-    ax_brake.plot(slow_arc, slow_brake_norm, color="#e67e22", lw=1.4,
+    ax_brake.plot(slow_arc_sorted, slow_brake_norm_sorted, color="#e67e22", lw=1.4,
                   alpha=0.9, label="Slow lap", zorder=3)
     ax_brake.set_title("Brake pressure (normalised 0–1)", fontsize=10, loc="left")
     ax_brake.set_ylabel("Brake (norm.)")
@@ -524,7 +531,7 @@ def plot_brake_analysis(
 
     # ── 2. Speed ─────────────────────────────────────────────────────────────
     ax_speed.plot(ref_arc,  ref_speed,  color="#2980b9", lw=1.4, label="Reference")
-    ax_speed.plot(slow_arc, slow_speed, color="#e67e22", lw=1.4, alpha=0.9, label="Slow lap")
+    ax_speed.plot(slow_arc_sorted, slow_speed_sorted, color="#e67e22", lw=1.4, alpha=0.9, label="Slow lap")
     ax_speed.set_title("Speed (m/s)", fontsize=10, loc="left")
     ax_speed.set_ylabel("Speed (m/s)")
     ax_speed.set_xlabel("Arc-length (m)")
@@ -538,7 +545,7 @@ def plot_brake_analysis(
 
     # ── 3. Steering ──────────────────────────────────────────────────────────
     ax_steer.plot(ref_arc,  ref_steer,  color="#2980b9", lw=1.4, label="Reference")
-    ax_steer.plot(slow_arc, slow_steer, color="#e67e22", lw=1.4, alpha=0.9, label="Slow lap")
+    ax_steer.plot(slow_arc_sorted, slow_steer_sorted, color="#e67e22", lw=1.4, alpha=0.9, label="Slow lap")
     ax_steer.axhline(0, color="#bbb", lw=0.7)
     ax_steer.set_title("Steering angle (rad)  — shows trail-braking overlap",
                        fontsize=10, loc="left")
@@ -569,12 +576,13 @@ if __name__ == "__main__":
     import sys
 
     print("Loading reference (fast) lap …")
-    ref_states = LapDataParser("data/hackathon/hackathon_fast_laps.mcap").get_lap_data()
-    ref_arc    = _arc_length(ref_states)
+    ref_states  = LapDataParser("data/hackathon/hackathon_fast_laps.mcap").get_lap_data()
 
     print("Loading slow lap …")
     slow_states = LapDataParser("data/hackathon/hackathon_good_lap.mcap").get_lap_data()
-    slow_arc    = _arc_length(slow_states)
+
+    # slow_arc is expressed in reference metres — no independent arc calculation
+    ref_arc, slow_arc, _ = align_laps(ref_states, slow_states)
 
     print("Detecting brake events …")
     ref_events  = detect_brake_events(ref_states,  ref_arc)

@@ -547,6 +547,11 @@ def plot_steering_analysis(
     ref_steer  = np.array([s.steering for s in ref_states])
     slow_steer = np.array([s.steering for s in slow_states])
 
+    # Sort slow-lap data by mapped x-coordinate to prevent vertical spikes
+    slow_order = np.argsort(slow_arc, kind="stable")
+    slow_arc_sorted = slow_arc[slow_order]
+    slow_steer_sorted = np.array([s.steering for s in slow_states])[slow_order]
+
     fig, axes = plt.subplots(3, 1, figsize=(18, 12))
     fig.suptitle("Steering Analysis — Reference (blue) vs Slow Lap (orange)",
                  fontsize=13, fontweight="bold")
@@ -555,7 +560,7 @@ def plot_steering_analysis(
 
     # ── Panel 1: Raw signed steering traces ──────────────────────────────────
     ax_raw.plot(ref_arc,  ref_steer,  color="#2980b9", lw=1.3, label="Reference", zorder=3)
-    ax_raw.plot(slow_arc, slow_steer, color="#e67e22", lw=1.3, alpha=0.85,
+    ax_raw.plot(slow_arc_sorted, slow_steer_sorted, color="#e67e22", lw=1.3, alpha=0.85,
                 label="Slow lap", zorder=3)
     ax_raw.axhline(0, color="#aaa", lw=0.7, zorder=1)
     ax_raw.set_title("Steering angle (signed, rad)  ← left  /  right →",
@@ -596,7 +601,7 @@ def plot_steering_analysis(
 
     # ── Panel 2: |steering| + corner phase shading ───────────────────────────
     ax_abs.plot(ref_arc,  np.abs(ref_steer),  color="#2980b9", lw=1.3, label="Reference |steer|")
-    ax_abs.plot(slow_arc, np.abs(slow_steer), color="#e67e22", lw=1.3, alpha=0.85,
+    ax_abs.plot(slow_arc_sorted, np.abs(slow_steer_sorted), color="#e67e22", lw=1.3, alpha=0.85,
                 label="Slow |steer|")
     ax_abs.set_title("|Steering| with corner windows shaded", fontsize=10, loc="left")
     ax_abs.set_ylabel("|Steering| (rad)")
@@ -615,7 +620,7 @@ def plot_steering_analysis(
         ref_apex_val = abs(float(ref_steer[m.ref.apex_idx]))
         ax_abs.plot(m.ref.apex_arc, ref_apex_val, "o", color="#2980b9", ms=7, zorder=5)
         if m.slow is not None:
-            slow_apex_val = abs(float(slow_steer[m.slow.apex_idx]))
+            slow_apex_val = abs(float(slow_steer_sorted[m.slow.apex_idx]))
             ax_abs.plot(m.slow.apex_arc, slow_apex_val, "o", color="#e67e22", ms=7, zorder=5)
 
     ax_abs.legend(fontsize=8, loc="upper right")
@@ -673,18 +678,18 @@ def plot_steering_analysis(
 
 if __name__ == "__main__":
     import sys
-    from parser import LapDataParser
-    from parser import _arc_length
+    from parser import LapDataParser, align_laps
 
     print("Loading reference (fast) lap …")
     ref_states = LapDataParser("data/hackathon/hackathon_fast_laps.mcap").get_lap_data()
-    ref_arc    = _arc_length(ref_states)
     ref_steer  = np.array([s.steering for s in ref_states])
 
     print("Loading slow lap …")
     slow_states = LapDataParser("data/hackathon/hackathon_good_lap.mcap").get_lap_data()
-    slow_arc    = _arc_length(slow_states)
     slow_steer  = np.array([s.steering for s in slow_states])
+
+    # slow_arc is expressed in reference metres — no independent arc calculation
+    ref_arc, slow_arc, _ = align_laps(ref_states, slow_states)
 
     print("Detecting corners …")
     ref_corners  = detect_corners(ref_states,  ref_arc)

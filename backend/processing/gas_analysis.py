@@ -559,12 +559,17 @@ def plot_gas_analysis(
     ref_gas  = np.array([s.gas for s in ref_states])
     slow_gas = np.array([s.gas for s in slow_states])
 
+    # Sort slow-lap data by mapped x-coordinate to prevent vertical spikes
+    slow_order = np.argsort(slow_arc, kind="stable")
+    slow_arc_sorted = slow_arc[slow_order]
+    slow_gas_sorted = np.array([s.gas for s in slow_states])[slow_order]
+
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 8), sharex=False)
     fig.suptitle("Gas / Throttle Analysis", fontsize=13, fontweight="bold")
 
     for ax in (ax1, ax2):
         ax.plot(ref_arc,  ref_gas,  color="#2980b9", lw=1.4, label="Reference (fast)", zorder=3)
-        ax.plot(slow_arc, slow_gas, color="#e67e22", lw=1.4, alpha=0.85, label="Slow lap", zorder=3)
+        ax.plot(slow_arc_sorted, slow_gas_sorted, color="#e67e22", lw=1.4, alpha=0.85, label="Slow lap", zorder=3)
         ax.set_ylabel("Gas (0–1)", fontsize=9)
         ax.set_xlabel("Arc-length (m)", fontsize=9)
         ax.grid(True, alpha=0.3)
@@ -659,16 +664,16 @@ def plot_gas_analysis(
 
 if __name__ == "__main__":
     import sys
-    from parser import LapDataParser
-    from parser import _arc_length   # reuse helper
+    from parser import LapDataParser, _arc_length, align_laps
 
     print("Loading reference (fast) lap …")
-    ref_states = LapDataParser("data/hackathon/hackathon_fast_laps.mcap").get_lap_data()
-    ref_arc    = _arc_length(ref_states)
+    ref_states  = LapDataParser("data/hackathon/hackathon_fast_laps.mcap").get_lap_data()
 
     print("Loading slow lap …")
     slow_states = LapDataParser("data/hackathon/hackathon_good_lap.mcap").get_lap_data()
-    slow_arc    = _arc_length(slow_states)
+
+    # slow_arc is expressed in reference metres — no independent arc calculation
+    ref_arc, slow_arc, _ = align_laps(ref_states, slow_states)
 
     ref_apps  = detect_throttle_applications(ref_states,  ref_arc)
     slow_apps = detect_throttle_applications(slow_states, slow_arc)
