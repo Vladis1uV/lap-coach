@@ -1,455 +1,562 @@
 """
-Spike detection, lap-timing comparison, and matplotlib visualisation.
+brake_analysis.py
+=================
+Brake-event detection and lap comparison.
 
-Workflow
---------
-1. Detect "action spikes" (brake / throttle / steer events) in the reference
-   (fast) lap using a simple threshold + minimum-gap filter.
-2. For each reference spike, search a spatial vicinity in the slow lap to see
-   whether the driver performed the same action — earlier, later, or not at all.
-3. Emit human-readable coaching recommendations.
-4. Plot overlaid channel traces (brake, gas, steering, speed) aligned on
-   arc-length along the track, with spike annotations.
+Brake pressure is a *spike* signal — sharp application, hold, release.
+The meaningful events are:
 
-Dependencies
-------------
-    pip install matplotlib numpy scipy
-    (lap_data module must be on PYTHONPATH)
+  - **BrakeEvent**: a single braking zone, characterised by:
+      · entry_arc  — where pressure crosses a threshold going up (brake point)
+      · peak_arc   — maximum pressure (peak braking)
+      · exit_arc   — where pressure falls back below threshold (release)
+      · peak_value — normalised peak pressure (0–1)
+      · duration_m — length of the braking zone in metres
+
+Detection works on a **signal normalised to [0, 1]** within each lap so that
+thresholds are scale-independent regardless of whether the raw signal is in
+Pascals, bar, or a 0-1 CAN value.
+
+Plots (separate figures / axes):
+  1. Brake pressure — reference vs slow, with event markers and search windows
+  2. Speed         — reference vs slow (context for braking zones)
+  3. Steering      — reference vs slow (shows what driver does mid-brake)
+
+Public API
+----------
+    detect_brake_events(states, arc, **kwargs) -> list[BrakeEvent]
+    match_brake_events(ref, slow, ...)         -> list[BrakeMatch]
+    print_brake_recommendations(matches)
+    plot_brake_analysis(...)
+
+Dependencies: numpy, scipy, matplotlib
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable
 
-import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import numpy as np
+from scipy.ndimage import uniform_filter1d
 from scipy.signal import find_peaks
 
-from parser import CarState, LapDataParser, match_laps
+from parser import LapDataParser, _arc_length
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _arc_length(states: list[CarState]) -> np.ndarray:
-    """Cumulative 2-D arc-length (metres) along the list of CarState positions."""
-    s = np.zeros(len(states))
-    for i in range(1, len(states)):
-        dx = states[i].x - states[i - 1].x
-        dy = states[i].y - states[i - 1].y
-        s[i] = s[i - 1] + math.hypot(dx, dy)
-    return s
+def _get_channel(states: list, attr: str) -> np.ndarray:
+    return np.array([getattr(s, attr) for s in states])
 
 
-def _channel(states: list[CarState], attr: str) -> np.ndarray:
-    return np.array([getattr(st, attr) for st in states])
+def _smooth(signal: np.ndarray, window: int = 9) -> np.ndarray:
+    return uniform_filter1d(signal.astype(float), size=max(1, window))
+
+
+def _normalise(signal: np.ndarray) -> tuple[np.ndarray, float]:
+    """Return (signal / max, max).  max is stored so raw values can be reported."""
+    peak = float(signal.max())
+    if peak < 1e-9:
+        return signal.copy(), 1.0
+    return signal / peak, peak
+
+
+def _arc_to_samples(arc: np.ndarray, metres: float) -> int:
+    if len(arc) < 2 or arc[-1] <= arc[0]:
+        return 1
+    avg = (arc[-1] - arc[0]) / (len(arc) - 1)
+    return max(1, int(metres / avg))
 
 
 # ---------------------------------------------------------------------------
-# Spike detection
+# BrakeEvent dataclass
 # ---------------------------------------------------------------------------
 
 @dataclass
-class Spike:
-    """A single detected action spike in one channel of one lap."""
-    channel: str          # "brake" | "gas" | "steering"
-    index: int            # index into the states list
-    arc_pos: float        # arc-length position (m)
-    value: float          # peak value
-    x: float
-    y: float
+class BrakeEvent:
+    """A single braking zone."""
+    # Indices into the states list
+    entry_idx: int
+    peak_idx:  int
+    exit_idx:  int
+
+    # Arc-length positions (m)
+    entry_arc:  float
+    peak_arc:   float
+    exit_arc:   float
+    duration_m: float   # exit_arc - entry_arc
+
+    # Normalised (0–1) values
+    peak_norm:  float   # peak pressure, normalised
+
+    # Track position
+    x_entry: float
+    y_entry: float
+    x_peak:  float
+    y_peak:  float
 
 
-def detect_spikes(
-    states: list[CarState],
+# ---------------------------------------------------------------------------
+# Detection
+# ---------------------------------------------------------------------------
+
+def detect_brake_events(
+    states: list,
     arc: np.ndarray,
-    channel: str,
     *,
-    height: float = 0.15,          # minimum peak height (normalised 0-1 or rad)
-    prominence: float = 0.10,      # scipy prominence threshold
-    min_gap_m: float = 20.0,       # minimum metres between two spikes
-) -> list[Spike]:
-    """Return spikes in *channel* for *states* using scipy.find_peaks.
-
-    Parameters
-    ----------
-    height:      Absolute minimum value to count as a spike.
-    prominence:  How much the peak must stand out from its surroundings.
-    min_gap_m:   Minimum arc-length distance (m) between consecutive spikes.
-                 Converts to a sample-based `distance` for find_peaks.
+    # All thresholds operate on the 0-1 normalised signal
+    entry_threshold: float  = 0.15,   # normalised pressure to call "braking started"
+    peak_min:        float  = 0.35,   # minimum normalised peak to count as an event
+    prominence:      float  = 0.25,   # how much the peak must stand out
+    min_gap_m:       float  = 40.0,   # minimum metres between two events
+    walk_limit_m:    float  = 80.0,   # max metres to walk back/forward from peak
+    smooth_window:   int    = 11,     # pre-smoothing (removes sensor buzz)
+) -> list[BrakeEvent]:
     """
-    signal = _channel(states, channel)
+    Detect braking zones from a (possibly raw-unit) brake signal.
 
-    # For steering we care about magnitude (left and right turns)
-    if channel == "steering":
-        signal = np.abs(signal)
+    The signal is normalised to [0, 1] before any threshold is applied, so
+    all parameters are scale-independent.
 
-    # Estimate average sample spacing to convert metres → samples
-    if len(arc) > 1:
-        avg_spacing = (arc[-1] - arc[0]) / (len(arc) - 1)
-        min_gap_samples = max(1, int(min_gap_m / avg_spacing)) if avg_spacing > 0 else 1
-    else:
-        min_gap_samples = 1
+    Algorithm
+    ---------
+    1. Smooth → normalise → find peaks (scipy).
+    2. For each peak walk backward to entry_threshold → entry point.
+    3. Walk forward to entry_threshold → exit point.
+    4. Enforce min_gap between events.
+    """
+    raw = _get_channel(states, "brake")
+    smoothed = _smooth(raw, smooth_window)
+    norm, _scale = _normalise(smoothed)
 
-    peak_indices, props = find_peaks(
-        signal,
-        height=height,
+    min_gap_s  = _arc_to_samples(arc, min_gap_m)
+    walk_lim   = _arc_to_samples(arc, walk_limit_m)
+    n          = len(norm)
+
+    peak_indices, _ = find_peaks(
+        norm,
+        height=peak_min,
         prominence=prominence,
-        distance=min_gap_samples,
+        distance=min_gap_s,
     )
 
-    return [
-        Spike(
-            channel=channel,
-            index=int(idx),
-            arc_pos=float(arc[idx]),
-            value=float(signal[idx]),
-            x=states[idx].x,
-            y=states[idx].y,
-        )
-        for idx in peak_indices
-    ]
+    events: list[BrakeEvent] = []
+
+    for pi in peak_indices:
+        # Walk backward → entry
+        entry_idx = pi
+        for k in range(pi - 1, max(0, pi - walk_lim) - 1, -1):
+            if norm[k] < entry_threshold:
+                entry_idx = k
+                break
+        else:
+            entry_idx = max(0, pi - walk_lim)
+
+        # Walk forward → exit
+        exit_idx = pi
+        for k in range(pi + 1, min(n, pi + walk_lim)):
+            if norm[k] < entry_threshold:
+                exit_idx = k
+                break
+        else:
+            exit_idx = min(n - 1, pi + walk_lim)
+
+        events.append(BrakeEvent(
+            entry_idx  = int(entry_idx),
+            peak_idx   = int(pi),
+            exit_idx   = int(exit_idx),
+            entry_arc  = float(arc[entry_idx]),
+            peak_arc   = float(arc[pi]),
+            exit_arc   = float(arc[exit_idx]),
+            duration_m = float(arc[exit_idx] - arc[entry_idx]),
+            peak_norm  = float(norm[pi]),
+            x_entry    = states[entry_idx].x,
+            y_entry    = states[entry_idx].y,
+            x_peak     = states[pi].x,
+            y_peak     = states[pi].y,
+        ))
+
+    return events
 
 
 # ---------------------------------------------------------------------------
-# Spike matching & recommendations
+# Verdicts
 # ---------------------------------------------------------------------------
 
-class Verdict(Enum):
-    ON_TIME   = auto()   # slow lap has a matching spike within tolerance
-    TOO_LATE  = auto()   # slow lap spike is after the reference
-    TOO_EARLY = auto()   # slow lap spike is before the reference
-    MISSING   = auto()   # no spike found in search window
+class EntryVerdict(Enum):
+    ON_TIME   = auto()
+    TOO_LATE  = auto()   # slow driver brakes later (carries more speed — or overshot)
+    TOO_EARLY = auto()   # slow driver brakes earlier than needed
 
+
+class PeakVerdict(Enum):
+    SIMILAR     = auto()
+    TOO_HARD    = auto()   # slow driver peaks higher (panic braking)
+    TOO_LIGHT   = auto()   # slow driver peaks lower (under-braking, trail-braking?)
+
+
+class ReleaseVerdict(Enum):
+    ON_TIME   = auto()
+    TOO_EARLY = auto()   # slow driver releases pressure before the corner
+    TOO_LATE  = auto()   # slow driver holds brakes too long into the corner
+
+
+# ---------------------------------------------------------------------------
+# BrakeMatch
+# ---------------------------------------------------------------------------
 
 @dataclass
-class SpikeMatch:
-    ref_spike: Spike
-    slow_spike: Spike | None       # None when MISSING
-    verdict: Verdict
-    offset_m: float                # slow_arc − ref_arc (+ = later on track)
-    recommendation: str
+class BrakeMatch:
+    ref:  BrakeEvent
+    slow: BrakeEvent | None
+
+    entry_verdict:   EntryVerdict
+    peak_verdict:    PeakVerdict
+    release_verdict: ReleaseVerdict
+
+    entry_offset_m:   float   # slow.entry_arc  − ref.entry_arc
+    peak_offset_m:    float   # slow.peak_arc   − ref.peak_arc
+    release_offset_m: float   # slow.exit_arc   − ref.exit_arc
+    peak_norm_delta:  float   # slow.peak_norm  − ref.peak_norm
+
+    recommendations: list[str]
 
 
-def _find_nearest_spike(
+# ---------------------------------------------------------------------------
+# Matching
+# ---------------------------------------------------------------------------
+
+def _nearest_event(
     target_arc: float,
-    slow_spikes: list[Spike],
-    search_radius_m: float,
-) -> Spike | None:
-    """Return the slow spike closest to *target_arc* within *search_radius_m*, or None."""
-    candidates = [
-        sp for sp in slow_spikes
-        if abs(sp.arc_pos - target_arc) <= search_radius_m
-    ]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda sp: abs(sp.arc_pos - target_arc))
+    candidates: list[BrakeEvent],
+    radius_m: float,
+) -> BrakeEvent | None:
+    within = [e for e in candidates if abs(e.peak_arc - target_arc) <= radius_m]
+    return min(within, key=lambda e: abs(e.peak_arc - target_arc)) if within else None
 
 
-_CHANNEL_VERBS: dict[str, tuple[str, str]] = {
-    # channel → (action_word, earlier_advice)
-    "brake":    ("brake",  "brake earlier"),
-    "gas":      ("apply throttle", "get on the gas sooner"),
-    "steering": ("turn",   "initiate the turn earlier"),
-}
-
-_LATE_ADVICE: dict[str, str] = {
-    "brake":    "brake later / carry more speed",
-    "gas":      "hold off the throttle a bit longer",
-    "steering": "delay your turn-in",
-}
-
-
-def match_spikes(
-    ref_spikes: list[Spike],
-    slow_spikes: list[Spike],
+def match_brake_events(
+    ref_events:  list[BrakeEvent],
+    slow_events: list[BrakeEvent],
     *,
-    on_time_window_m: float = 10.0,   # ±m considered "on time"
-    search_radius_m: float = 60.0,    # wider window to detect shifted spikes
-) -> list[SpikeMatch]:
-    """
-    For every reference spike, decide whether the slow lap driver did the same
-    action on time, too early, too late, or not at all.
-    """
-    results: list[SpikeMatch] = []
-    verb, earlier = _CHANNEL_VERBS.get(ref_spikes[0].channel if ref_spikes else "brake",
-                                       ("act", "act earlier"))
+    on_time_window_m:  float = 10.0,
+    search_radius_m:   float = 80.0,
+    peak_norm_tol:     float = 0.10,   # normalised pressure difference tolerance
+) -> list[BrakeMatch]:
+    results: list[BrakeMatch] = []
 
-    for ref in ref_spikes:
-        ch = ref.channel
-        verb, earlier_adv = _CHANNEL_VERBS.get(ch, ("act", "act earlier"))
-        late_adv = _LATE_ADVICE.get(ch, "act later")
-
-        slow = _find_nearest_spike(ref.arc_pos, slow_spikes, search_radius_m)
+    for ref in ref_events:
+        slow = _nearest_event(ref.peak_arc, slow_events, search_radius_m)
 
         if slow is None:
-            verdict = Verdict.MISSING
-            offset = float("nan")
-            rec = (
-                f"At ~{ref.arc_pos:.0f} m you should {verb} "
-                f"(peak ≈ {ref.value:.2f}) — no matching action detected."
-            )
-        else:
-            offset = slow.arc_pos - ref.arc_pos
-            if abs(offset) <= on_time_window_m:
-                verdict = Verdict.ON_TIME
-                rec = (
-                    f"At ~{ref.arc_pos:.0f} m your {ch} timing is good "
-                    f"(offset {offset:+.1f} m)."
-                )
-            elif offset > 0:
-                # slow lap spike is further along the track → driver acts later
-                verdict = Verdict.TOO_LATE
-                rec = (
-                    f"At ~{ref.arc_pos:.0f} m you should {earlier_adv} — "
-                    f"you were {abs(offset):.1f} m late "
-                    f"(your peak at {slow.arc_pos:.0f} m, "
-                    f"reference at {ref.arc_pos:.0f} m)."
-                )
-            else:
-                verdict = Verdict.TOO_EARLY
-                rec = (
-                    f"At ~{ref.arc_pos:.0f} m you can {late_adv} — "
-                    f"you acted {abs(offset):.1f} m too early "
-                    f"(your peak at {slow.arc_pos:.0f} m, "
-                    f"reference at {ref.arc_pos:.0f} m)."
-                )
+            results.append(BrakeMatch(
+                ref=ref, slow=None,
+                entry_verdict=EntryVerdict.TOO_LATE,
+                peak_verdict=PeakVerdict.SIMILAR,
+                release_verdict=ReleaseVerdict.ON_TIME,
+                entry_offset_m=float("nan"),
+                peak_offset_m=float("nan"),
+                release_offset_m=float("nan"),
+                peak_norm_delta=float("nan"),
+                recommendations=[
+                    f"At ~{ref.peak_arc:.0f} m no braking event found in the slow lap "
+                    f"(searched ±{search_radius_m:.0f} m). "
+                    f"The reference brakes here to {ref.peak_norm:.0%} — you may be "
+                    f"carrying too much speed or missing the braking zone entirely."
+                ],
+            ))
+            continue
 
-        results.append(SpikeMatch(
-            ref_spike=ref,
-            slow_spike=slow,
-            verdict=verdict,
-            offset_m=offset,
-            recommendation=rec,
+        en_off  = slow.entry_arc - ref.entry_arc
+        pk_off  = slow.peak_arc  - ref.peak_arc
+        rel_off = slow.exit_arc  - ref.exit_arc
+        pk_d    = slow.peak_norm - ref.peak_norm
+
+        # Classify entry
+        if abs(en_off) <= on_time_window_m:
+            en_v = EntryVerdict.ON_TIME
+        elif en_off > 0:
+            en_v = EntryVerdict.TOO_LATE
+        else:
+            en_v = EntryVerdict.TOO_EARLY
+
+        # Classify peak
+        if abs(pk_d) <= peak_norm_tol:
+            pk_v = PeakVerdict.SIMILAR
+        elif pk_d > 0:
+            pk_v = PeakVerdict.TOO_HARD
+        else:
+            pk_v = PeakVerdict.TOO_LIGHT
+
+        # Classify release
+        if abs(rel_off) <= on_time_window_m:
+            rel_v = ReleaseVerdict.ON_TIME
+        elif rel_off < 0:
+            rel_v = ReleaseVerdict.TOO_EARLY
+        else:
+            rel_v = ReleaseVerdict.TOO_LATE
+
+        recs: list[str] = []
+        z = f"~{ref.peak_arc:.0f} m"
+
+        if en_v == EntryVerdict.TOO_LATE:
+            recs.append(
+                f"[{z}] Brake {abs(en_off):.0f} m earlier — "
+                f"you hit the brakes at {slow.entry_arc:.0f} m, "
+                f"reference brakes at {ref.entry_arc:.0f} m. "
+                f"Late braking costs you corner entry speed."
+            )
+        elif en_v == EntryVerdict.TOO_EARLY:
+            recs.append(
+                f"[{z}] You can brake {abs(en_off):.0f} m later — "
+                f"you braked at {slow.entry_arc:.0f} m vs reference {ref.entry_arc:.0f} m. "
+                f"Braking earlier than needed scrubs speed unnecessarily."
+            )
+
+        if pk_v == PeakVerdict.TOO_HARD:
+            recs.append(
+                f"[{z}] You're braking harder than the reference "
+                f"({slow.peak_norm:.0%} vs {ref.peak_norm:.0%} normalised). "
+                f"This often follows a late entry — the extra pressure compensates "
+                f"for running out of braking distance."
+            )
+        elif pk_v == PeakVerdict.TOO_LIGHT:
+            recs.append(
+                f"[{z}] Your peak brake pressure ({slow.peak_norm:.0%}) is lower than "
+                f"the reference ({ref.peak_norm:.0%}). "
+                f"Commit to initial braking harder — trail off as you turn in."
+            )
+
+        if rel_v == ReleaseVerdict.TOO_EARLY:
+            recs.append(
+                f"[{z}] You release brakes {abs(rel_off):.0f} m before the reference. "
+                f"Releasing too early loses the rotation trail-braking provides — "
+                f"hold a little pressure as you turn in."
+            )
+        elif rel_v == ReleaseVerdict.TOO_LATE:
+            recs.append(
+                f"[{z}] You hold brakes {abs(rel_off):.0f} m past the reference exit. "
+                f"Braking too deep into the corner tightens the radius and "
+                f"delays throttle application on exit."
+            )
+
+        if not recs:
+            recs.append(
+                f"[{z}] Braking zone matches the reference well "
+                f"(entry Δ{en_off:+.0f} m, peak Δ{pk_d:+.0%}, release Δ{rel_off:+.0f} m)."
+            )
+
+        results.append(BrakeMatch(
+            ref=ref, slow=slow,
+            entry_verdict=en_v,
+            peak_verdict=pk_v,
+            release_verdict=rel_v,
+            entry_offset_m=en_off,
+            peak_offset_m=pk_off,
+            release_offset_m=rel_off,
+            peak_norm_delta=pk_d,
+            recommendations=recs,
         ))
 
     return results
 
 
 # ---------------------------------------------------------------------------
-# Full analysis across all channels
+# Console report
 # ---------------------------------------------------------------------------
 
-@dataclass
-class LapAnalysis:
-    ref_states:  list[CarState]
-    slow_states: list[CarState]
-    ref_arc:     np.ndarray
-    slow_arc:    np.ndarray
-
-    # Spikes per channel
-    ref_spikes:  dict[str, list[Spike]]  = field(default_factory=dict)
-    slow_spikes: dict[str, list[Spike]]  = field(default_factory=dict)
-
-    # Matched results per channel
-    matches: dict[str, list[SpikeMatch]] = field(default_factory=dict)
-
-
-CHANNELS = ["brake", "gas", "steering"]
-
-SPIKE_PARAMS: dict[str, dict] = {
-    "brake":    dict(height=0.10, prominence=0.08, min_gap_m=15.0),
-    "gas":      dict(height=0.20, prominence=0.15, min_gap_m=20.0),
-    "steering": dict(height=0.05, prominence=0.04, min_gap_m=15.0),
+_ICONS = {
+    EntryVerdict.ON_TIME:       "✅",
+    EntryVerdict.TOO_LATE:      "⚠️ ",
+    EntryVerdict.TOO_EARLY:     "⚠️ ",
+    PeakVerdict.SIMILAR:        "✅",
+    PeakVerdict.TOO_HARD:       "⚠️ ",
+    PeakVerdict.TOO_LIGHT:      "⚠️ ",
+    ReleaseVerdict.ON_TIME:     "✅",
+    ReleaseVerdict.TOO_EARLY:   "⚠️ ",
+    ReleaseVerdict.TOO_LATE:    "⚠️ ",
 }
 
 
-def analyse_laps(
-    ref_states: list[CarState],
-    slow_states: list[CarState],
-    *,
-    on_time_window_m: float = 10.0,
-    search_radius_m: float = 60.0,
-) -> LapAnalysis:
-    """Run the full spike-detection and matching pipeline."""
-    ref_arc  = _arc_length(ref_states)
-    slow_arc = _arc_length(slow_states)
-
-    result = LapAnalysis(
-        ref_states=ref_states,
-        slow_states=slow_states,
-        ref_arc=ref_arc,
-        slow_arc=slow_arc,
-    )
-
-    for ch in CHANNELS:
-        params = SPIKE_PARAMS[ch]
-        result.ref_spikes[ch]  = detect_spikes(ref_states,  ref_arc,  ch, **params)
-        result.slow_spikes[ch] = detect_spikes(slow_states, slow_arc, ch, **params)
-
-        if result.ref_spikes[ch]:
-            result.matches[ch] = match_spikes(
-                result.ref_spikes[ch],
-                result.slow_spikes[ch],
-                on_time_window_m=on_time_window_m,
-                search_radius_m=search_radius_m,
-            )
-        else:
-            result.matches[ch] = []
-
-    return result
+def print_brake_recommendations(matches: list[BrakeMatch]) -> None:
+    print("\n" + "=" * 64)
+    print(f"  BRAKES — {len(matches)} reference braking zones analysed")
+    print("=" * 64)
+    for m in matches:
+        ei = _ICONS.get(m.entry_verdict,   "?")
+        pi = _ICONS.get(m.peak_verdict,    "?")
+        ri = _ICONS.get(m.release_verdict, "?")
+        print(f"\n  Zone ~{m.ref.peak_arc:.0f} m  |  "
+              f"entry {ei}  peak {pi}  release {ri}")
+        for rec in m.recommendations:
+            print(f"    • {rec}")
 
 
 # ---------------------------------------------------------------------------
-# Reporting
+# Colours
 # ---------------------------------------------------------------------------
 
-def print_recommendations(analysis: LapAnalysis) -> None:
-    """Print coaching recommendations grouped by channel to stdout."""
-    verdict_order = [Verdict.MISSING, Verdict.TOO_LATE, Verdict.TOO_EARLY, Verdict.ON_TIME]
-    verdict_label = {
-        Verdict.MISSING:   "MISSING",
-        Verdict.TOO_LATE:  "TOO LATE",
-        Verdict.TOO_EARLY: "TOO EARLY",
-        Verdict.ON_TIME:   "ON TIME",
-    }
-
-    for ch in CHANNELS:
-        matches = analysis.matches.get(ch, [])
-        if not matches:
-            continue
-        print(f"\n{'='*60}")
-        print(f"  {ch.upper()} — {len(matches)} reference spikes")
-        print(f"{'='*60}")
-        for m in sorted(matches, key=lambda m: verdict_order.index(m.verdict)):
-            print(f"  [{verdict_label[m.verdict]}]  {m.recommendation}")
-
-
-# ---------------------------------------------------------------------------
-# Plotting
-# ---------------------------------------------------------------------------
-
-_CHANNEL_LABELS = {
-    "brake":    ("Brake input", "0–1 (normalised)"),
-    "gas":      ("Throttle input", "0–1 (normalised)"),
-    "steering": ("Steering angle", "rad"),
-    "speed":    ("Speed", "m/s"),
+_EN_COL = {
+    EntryVerdict.ON_TIME:   "#2ecc71",
+    EntryVerdict.TOO_LATE:  "#e74c3c",
+    EntryVerdict.TOO_EARLY: "#f1c40f",
 }
-
-_VERDICT_COLORS = {
-    Verdict.MISSING:   "#e74c3c",
-    Verdict.TOO_LATE:  "#e67e22",
-    Verdict.TOO_EARLY: "#f1c40f",
-    Verdict.ON_TIME:   "#2ecc71",
+_PK_COL = {
+    PeakVerdict.SIMILAR:   "#2ecc71",
+    PeakVerdict.TOO_HARD:  "#e74c3c",
+    PeakVerdict.TOO_LIGHT: "#f1c40f",
+}
+_REL_COL = {
+    ReleaseVerdict.ON_TIME:   "#2ecc71",
+    ReleaseVerdict.TOO_EARLY: "#f1c40f",
+    ReleaseVerdict.TOO_LATE:  "#e74c3c",
 }
 
 
-def plot_analysis(
-    analysis: LapAnalysis,
-    channels_to_plot: list[str] | None = None,
-    save_path: str | None = None,
+# ---------------------------------------------------------------------------
+# Plotting  (three separate subplots: brake / speed / steering)
+# ---------------------------------------------------------------------------
+
+def plot_brake_analysis(
+    ref_states:  list,
+    slow_states: list,
+    ref_arc:     np.ndarray,
+    slow_arc:    np.ndarray,
+    matches:     list[BrakeMatch],
+    ref_events:  list[BrakeEvent],
+    slow_events: list[BrakeEvent],
+    save_path:   str | None = None,
 ) -> None:
     """
-    Plot overlaid reference vs slow-lap traces for each channel.
-
-    Each subplot shows:
-      - Reference (fast) lap in blue
-      - Slow lap in orange (re-indexed on its own arc-length)
-      - Reference spike markers (▼, colour-coded by verdict)
-      - Slow-lap spike markers (▲)
-      - Shaded search windows around reference spikes
-
-    Parameters
-    ----------
-    channels_to_plot : list of channel names to include; defaults to all + speed.
-    save_path        : if given, save figure to this path instead of showing it.
+    Three separate subplots stacked vertically:
+      1. Brake pressure (normalised) — event markers + phase lines
+      2. Speed (m/s)                 — context for how braking affects speed
+      3. Steering angle (rad)        — shows trail-braking / mid-corner inputs
     """
-    if channels_to_plot is None:
-        channels_to_plot = ["brake", "gas", "steering", "speed"]
+    # Normalise brake signals for display (scale-independent)
+    ref_brake_raw  = _get_channel(ref_states,  "brake")
+    slow_brake_raw = _get_channel(slow_states, "brake")
+    ref_brake_norm,  _ = _normalise(_smooth(ref_brake_raw))
+    slow_brake_norm, _ = _normalise(_smooth(slow_brake_raw))
 
-    n = len(channels_to_plot)
-    fig, axes = plt.subplots(n, 1, figsize=(16, 4 * n), sharex=False)
-    if n == 1:
-        axes = [axes]
+    ref_speed  = _get_channel(ref_states,  "speed")
+    slow_speed = _get_channel(slow_states, "speed")
+    ref_steer  = _get_channel(ref_states,  "steering")
+    slow_steer = _get_channel(slow_states, "steering")
 
+    fig, (ax_brake, ax_speed, ax_steer) = plt.subplots(
+        3, 1, figsize=(18, 12), sharex=False
+    )
     fig.suptitle(
-        "Lap Comparison — Reference (blue) vs Slow Lap (orange)",
-        fontsize=14, fontweight="bold", y=1.01,
+        "Brake Analysis — Reference (blue) vs Slow Lap (orange)",
+        fontsize=13, fontweight="bold",
     )
 
-    ref_arc  = analysis.ref_arc
-    slow_arc = analysis.slow_arc
+    # ── 1. Brake pressure ────────────────────────────────────────────────────
+    ax_brake.plot(ref_arc,  ref_brake_norm,  color="#2980b9", lw=1.4,
+                  label="Reference", zorder=3)
+    ax_brake.plot(slow_arc, slow_brake_norm, color="#e67e22", lw=1.4,
+                  alpha=0.9, label="Slow lap", zorder=3)
+    ax_brake.set_title("Brake pressure (normalised 0–1)", fontsize=10, loc="left")
+    ax_brake.set_ylabel("Brake (norm.)")
+    ax_brake.set_xlabel("Arc-length (m)")
+    ax_brake.set_ylim(-0.05, 1.25)
+    ax_brake.grid(True, alpha=0.3)
 
-    for ax, ch in zip(axes, channels_to_plot):
-        ref_signal  = _channel(analysis.ref_states,  ch)
-        slow_signal = _channel(analysis.slow_states, ch)
+    # Map ref spike index → match for colour lookup
+    ref_idx_to_match = {m.ref.peak_idx: m for m in matches}
 
-        # -- traces --
-        ax.plot(ref_arc,  ref_signal,  color="#2980b9", lw=1.4,
-                label="Reference (fast)", zorder=3)
-        ax.plot(slow_arc, slow_signal, color="#e67e22", lw=1.4,
-                alpha=0.85, label="Slow lap", zorder=3)
+    for ev in ref_events:
+        m     = ref_idx_to_match.get(ev.peak_idx)
+        en_c  = _EN_COL[m.entry_verdict]   if m else "#aaa"
+        pk_c  = _PK_COL[m.peak_verdict]    if m else "#aaa"
+        rel_c = _REL_COL[m.release_verdict] if m else "#aaa"
 
-        title, ylabel = _CHANNEL_LABELS.get(ch, (ch.capitalize(), ""))
-        ax.set_title(title, fontsize=11, loc="left")
-        ax.set_ylabel(ylabel, fontsize=9)
-        ax.set_xlabel("Arc-length along track (m)", fontsize=9)
-        ax.grid(True, alpha=0.3)
+        # Shaded braking zone (reference)
+        ax_brake.axvspan(ev.entry_arc, ev.exit_arc,
+                         alpha=0.10, color="#2980b9", zorder=1)
 
-        if ch not in CHANNELS:
-            # speed has no spike analysis; just draw the traces
-            ax.legend(fontsize=8)
-            continue
+        # Phase markers: entry (dashed), peak (solid ▼), exit (dotted)
+        ax_brake.axvline(ev.entry_arc, color=en_c,  lw=1.3, ls="--", alpha=0.9, zorder=4)
+        ax_brake.axvline(ev.peak_arc,  color=pk_c,  lw=1.8, ls="-",  alpha=0.9, zorder=4)
+        ax_brake.axvline(ev.exit_arc,  color=rel_c, lw=1.3, ls=":",  alpha=0.9, zorder=4)
 
-        # -- reference spike markers (▼) --
-        ref_spikes  = analysis.ref_spikes.get(ch, [])
-        slow_spikes = analysis.slow_spikes.get(ch, [])
-        matches     = {m.ref_spike.index: m for m in analysis.matches.get(ch, [])}
+        # Peak marker ▼ on the trace
+        ax_brake.plot(ev.peak_arc, ev.peak_norm, "v",
+                      color=pk_c, ms=9, zorder=6)
 
-        # Shaded search windows first (behind everything)
-        search_radius = 60.0  # should match analyse_laps parameter
-        for sp in ref_spikes:
-            m = matches.get(sp.index)
-            color = _VERDICT_COLORS.get(m.verdict if m else Verdict.MISSING, "#aaa")
-            ax.axvspan(
-                sp.arc_pos - search_radius,
-                sp.arc_pos + search_radius,
-                alpha=0.07, color=color, zorder=1,
-            )
-
-        # Reference spikes ▼
-        for sp in ref_spikes:
-            m = matches.get(sp.index)
-            color = _VERDICT_COLORS.get(m.verdict if m else Verdict.MISSING, "#aaa")
-            ax.annotate(
+        # Offset arrow to slow lap peak (if matched)
+        if m and m.slow is not None and abs(m.peak_offset_m) > 3:
+            y_arrow = 1.10
+            ax_brake.annotate(
                 "",
-                xy=(sp.arc_pos, sp.value),
-                xytext=(sp.arc_pos, sp.value + 0.12 * (ax.get_ylim()[1] - ax.get_ylim()[0] or 1)),
-                arrowprops=dict(arrowstyle="->", color=color, lw=1.5),
-                zorder=5,
+                xy=(m.slow.peak_arc, y_arrow),
+                xytext=(ev.peak_arc,  y_arrow),
+                arrowprops=dict(arrowstyle="->", color=pk_c, lw=1.5),
+                zorder=7,
             )
-            ax.plot(sp.arc_pos, sp.value, "v", color=color, ms=8, zorder=6)
+            mid = (ev.peak_arc + m.slow.peak_arc) / 2
+            ax_brake.text(mid, 1.14, f"{m.peak_offset_m:+.0f} m",
+                          ha="center", fontsize=7, color=pk_c, zorder=8)
 
-        # Slow spike markers ▲ (plain, no colour coding)
-        for sp in slow_spikes:
-            sig_val = abs(sp.value) if ch == "steering" else sp.value
-            ax.plot(sp.arc_pos, sig_val, "^", color="#e67e22", ms=6,
-                    alpha=0.9, zorder=6)
+    # Slow-lap event peaks ▲
+    for ev in slow_events:
+        ax_brake.plot(ev.peak_arc, ev.peak_norm, "^",
+                      color="#e67e22", ms=7, alpha=0.85, zorder=5)
 
-        # Legend
-        legend_elements = [
-            mpatches.Patch(color="#2980b9", label="Reference (fast)"),
-            mpatches.Patch(color="#e67e22", label="Slow lap"),
-            plt.Line2D([0], [0], marker="v", color="w",
-                       markerfacecolor="#555", ms=9, label="Ref spike ▼ (colour = verdict)"),
-            plt.Line2D([0], [0], marker="^", color="w",
-                       markerfacecolor="#e67e22", ms=8, label="Slow spike ▲"),
-            mpatches.Patch(color=_VERDICT_COLORS[Verdict.ON_TIME],   alpha=0.4, label="On time"),
-            mpatches.Patch(color=_VERDICT_COLORS[Verdict.TOO_LATE],  alpha=0.4, label="Too late"),
-            mpatches.Patch(color=_VERDICT_COLORS[Verdict.TOO_EARLY], alpha=0.4, label="Too early"),
-            mpatches.Patch(color=_VERDICT_COLORS[Verdict.MISSING],   alpha=0.4, label="Missing"),
-        ]
-        ax.legend(handles=legend_elements, fontsize=7.5, loc="upper right", ncol=2)
+    legend_els = [
+        mpatches.Patch(color="#2980b9", label="Reference"),
+        mpatches.Patch(color="#e67e22", label="Slow lap"),
+        plt.Line2D([0], [0], color="#555", ls="--", lw=1.3, label="Entry"),
+        plt.Line2D([0], [0], color="#555", ls="-",  lw=1.8, label="Peak"),
+        plt.Line2D([0], [0], color="#555", ls=":",  lw=1.3, label="Release"),
+        mpatches.Patch(color="#2ecc71", alpha=0.5, label="On time / similar"),
+        mpatches.Patch(color="#e74c3c", alpha=0.5, label="Late / too hard"),
+        mpatches.Patch(color="#f1c40f", alpha=0.5, label="Early / too light"),
+    ]
+    ax_brake.legend(handles=legend_els, fontsize=7.5, loc="upper right", ncol=4)
+
+    # ── 2. Speed ─────────────────────────────────────────────────────────────
+    ax_speed.plot(ref_arc,  ref_speed,  color="#2980b9", lw=1.4, label="Reference")
+    ax_speed.plot(slow_arc, slow_speed, color="#e67e22", lw=1.4, alpha=0.9, label="Slow lap")
+    ax_speed.set_title("Speed (m/s)", fontsize=10, loc="left")
+    ax_speed.set_ylabel("Speed (m/s)")
+    ax_speed.set_xlabel("Arc-length (m)")
+    ax_speed.grid(True, alpha=0.3)
+
+    # Shade braking zones on speed plot too (helps correlate visually)
+    for ev in ref_events:
+        ax_speed.axvspan(ev.entry_arc, ev.exit_arc, alpha=0.08, color="#2980b9", zorder=1)
+
+    ax_speed.legend(fontsize=8, loc="upper right")
+
+    # ── 3. Steering ──────────────────────────────────────────────────────────
+    ax_steer.plot(ref_arc,  ref_steer,  color="#2980b9", lw=1.4, label="Reference")
+    ax_steer.plot(slow_arc, slow_steer, color="#e67e22", lw=1.4, alpha=0.9, label="Slow lap")
+    ax_steer.axhline(0, color="#bbb", lw=0.7)
+    ax_steer.set_title("Steering angle (rad)  — shows trail-braking overlap",
+                       fontsize=10, loc="left")
+    ax_steer.set_ylabel("Steering (rad)")
+    ax_steer.set_xlabel("Arc-length (m)")
+    ax_steer.grid(True, alpha=0.3)
+
+    # Shade braking zones so you can see when the driver is steering while braking
+    for ev in ref_events:
+        ax_steer.axvspan(ev.entry_arc, ev.exit_arc, alpha=0.08, color="#2980b9", zorder=1)
+
+    ax_steer.legend(fontsize=8, loc="upper right")
 
     plt.tight_layout()
 
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"Plot saved → {save_path}")
+        print(f"Brake analysis plot saved → {save_path}")
     else:
         plt.show()
 
@@ -462,19 +569,28 @@ if __name__ == "__main__":
     import sys
 
     print("Loading reference (fast) lap …")
-    ref_parser = LapDataParser(source_mcap="data/hackathon/hackathon_fast_laps.mcap")
-    ref_states = ref_parser.get_lap_data()
-    print(f"  {len(ref_states)} samples")
+    ref_states = LapDataParser("data/hackathon/hackathon_fast_laps.mcap").get_lap_data()
+    ref_arc    = _arc_length(ref_states)
 
-    print("Loading slow (good) lap …")
-    slow_parser = LapDataParser(source_mcap="data/hackathon/hackathon_good_lap.mcap")
-    slow_states = slow_parser.get_lap_data()
-    print(f"  {len(slow_states)} samples")
+    print("Loading slow lap …")
+    slow_states = LapDataParser("data/hackathon/hackathon_good_lap.mcap").get_lap_data()
+    slow_arc    = _arc_length(slow_states)
 
-    print("Analysing …")
-    analysis = analyse_laps(ref_states, slow_states)
+    print("Detecting brake events …")
+    ref_events  = detect_brake_events(ref_states,  ref_arc)
+    slow_events = detect_brake_events(slow_states, slow_arc)
+    print(f"  Reference brake zones : {len(ref_events)}")
+    print(f"  Slow lap brake zones  : {len(slow_events)}")
 
-    print_recommendations(analysis)
+    print("Matching …")
+    matches = match_brake_events(ref_events, slow_events)
+
+    print_brake_recommendations(matches)
 
     save = sys.argv[1] if len(sys.argv) > 1 else None
-    plot_analysis(analysis, save_path=save)
+    plot_brake_analysis(
+        ref_states, slow_states,
+        ref_arc, slow_arc,
+        matches, ref_events, slow_events,
+        save_path=save,
+    )

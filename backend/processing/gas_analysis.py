@@ -1,4 +1,5 @@
 """
+gas_analysis.py
 ===============
 Throttle-specific event detection for lap comparison.
 
@@ -77,59 +78,112 @@ def detect_throttle_applications(
     states: list,           # list[CarState]
     arc: np.ndarray,
     *,
-    low_threshold: float  = 0.10,   # gas level that defines "off throttle"
-    high_threshold: float = 0.55,   # gas level that must be reached to confirm
-    confirm_window_m: float = 40.0, # metres within which high_threshold must be hit
-    min_gap_m: float = 30.0,        # minimum metres between two events
-    smooth_window: int = 7,         # samples for pre-smoothing
+    low_threshold: float    = 0.10,   # gas level that defines "off throttle"
+    high_threshold: float   = 0.55,   # gas level that must be reached to confirm
+    confirm_window_m: float = 40.0,   # metres within which high_threshold must be hit
+    min_sustain_m: float    = 8.0,    # gas must stay above low_threshold for this many
+                                      # metres after the edge — filters gear-change blips
+    min_gap_m: float        = 30.0,   # minimum metres between two raw candidates
+    cluster_window_m: float = 80.0,   # post-detection: merge candidates within this
+                                      # window, keeping only the highest-peak one
+    smooth_window: int      = 7,      # samples for pre-smoothing
 ) -> list[ThrottleApplication]:
     """
     Detect throttle-application events (rising edges) in *states*.
 
-    Algorithm
-    ---------
-    1. Smooth the gas signal to remove noise.
-    2. Compute the discrete derivative (Δgas / sample).
-    3. Mark candidate edges: samples where gas crosses low_threshold upward
-       AND the derivative is positive.
-    4. For each candidate, scan forward up to confirm_window_m metres to check
-       that gas actually reaches high_threshold.  If it does, record an event.
-    5. Enforce minimum gap: suppress any new event within min_gap_m of the last.
+    Two-stage filtering keeps the marker count clean:
+
+    Stage 1 — per-edge validation (at detection time)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    A rising edge is a candidate only if:
+      a) gas crosses low_threshold going upward, AND
+      b) gas stays above low_threshold for at least min_sustain_m metres
+         (rejects gear-change blips that immediately drop back), AND
+      c) gas reaches high_threshold within confirm_window_m metres
+         (confirms it's a real commit, not a partial squeeze), AND
+      d) it is at least min_gap_m from the previous accepted candidate.
+
+    Stage 2 — cluster merging (post-detection)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    Any remaining candidates within cluster_window_m metres of each other
+    are collapsed into a single representative event — the one with the
+    highest peak_value.  This handles chicane sequences and complex
+    acceleration zones where a driver applies throttle, briefly lifts for
+    a kink, then reapplies: only the dominant application survives.
     """
     gas = _smooth(np.array([s.gas for s in states]), smooth_window)
     n = len(gas)
-    events: list[ThrottleApplication] = []
+    candidates: list[ThrottleApplication] = []
     last_event_arc = -min_gap_m - 1.0
 
     confirm_samples = _arc_to_sample_distance(arc, confirm_window_m)
-    min_gap_samples = _arc_to_sample_distance(arc, min_gap_m)
+    sustain_samples = _arc_to_sample_distance(arc, min_sustain_m)
 
     for i in range(1, n):
         # Rising edge: was below threshold, now at or above it
         if gas[i - 1] < low_threshold <= gas[i]:
-            # Enforce minimum gap
             if arc[i] - last_event_arc < min_gap_m:
                 continue
 
-            # Look ahead to confirm the application is genuine
-            end = min(i + confirm_samples, n)
-            window_gas = gas[i:end]
+            # Stage 1a — sustain check: must stay above low_threshold
+            sustain_end = min(i + sustain_samples, n)
+            if np.any(gas[i:sustain_end] < low_threshold):
+                continue   # drops back too quickly → blip, skip it
 
-            if window_gas.max() >= high_threshold:
-                peak_local = int(np.argmax(window_gas))
-                peak_idx   = i + peak_local
+            # Stage 1b — confirm check: must reach high_threshold
+            confirm_end = min(i + confirm_samples, n)
+            window_gas  = gas[i:confirm_end]
+            if window_gas.max() < high_threshold:
+                continue
 
-                events.append(ThrottleApplication(
-                    index=i,
-                    arc_pos=float(arc[i]),
-                    peak_value=float(window_gas[peak_local]),
-                    peak_arc=float(arc[peak_idx]),
-                    x=states[i].x,
-                    y=states[i].y,
-                ))
-                last_event_arc = float(arc[i])
+            peak_local = int(np.argmax(window_gas))
+            peak_idx   = i + peak_local
 
-    return events
+            candidates.append(ThrottleApplication(
+                index=i,
+                arc_pos=float(arc[i]),
+                peak_value=float(window_gas[peak_local]),
+                peak_arc=float(arc[peak_idx]),
+                x=states[i].x,
+                y=states[i].y,
+            ))
+            last_event_arc = float(arc[i])
+
+    # Stage 2 — cluster merging
+    return _cluster_applications(candidates, cluster_window_m)
+
+
+def _cluster_applications(
+    candidates: list[ThrottleApplication],
+    cluster_window_m: float,
+) -> list[ThrottleApplication]:
+    """
+    Collapse candidates within cluster_window_m metres into one representative.
+
+    Groups are formed greedily: a new group starts whenever the gap between
+    consecutive candidates (sorted by arc_pos) exceeds cluster_window_m.
+    The surviving event from each group is whichever has the highest peak_value
+    — i.e. the most committed throttle application in that zone.
+    """
+    if not candidates:
+        return []
+
+    # Sort by position (should already be sorted, but be safe)
+    sorted_cands = sorted(candidates, key=lambda e: e.arc_pos)
+
+    groups: list[list[ThrottleApplication]] = []
+    current_group = [sorted_cands[0]]
+
+    for prev, curr in zip(sorted_cands, sorted_cands[1:]):
+        if curr.arc_pos - prev.arc_pos <= cluster_window_m:
+            current_group.append(curr)
+        else:
+            groups.append(current_group)
+            current_group = [curr]
+    groups.append(current_group)
+
+    # Pick the highest-peak candidate from each group
+    return [max(g, key=lambda e: e.peak_value) for g in groups]
 
 
 # ---------------------------------------------------------------------------
@@ -606,7 +660,7 @@ def plot_gas_analysis(
 if __name__ == "__main__":
     import sys
     from parser import LapDataParser
-    from brake_analysis import _arc_length   # reuse helper
+    from parser import _arc_length   # reuse helper
 
     print("Loading reference (fast) lap …")
     ref_states = LapDataParser("data/hackathon/hackathon_fast_laps.mcap").get_lap_data()
