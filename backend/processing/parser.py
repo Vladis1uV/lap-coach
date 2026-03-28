@@ -4,6 +4,7 @@ import pathlib
 from dataclasses import dataclass
 
 from mcap_ros2.reader import read_ros2_messages
+import numpy as np
 
 # Project root — two levels up from this file
 DIR = pathlib.Path(__file__).parent.parent.parent
@@ -120,6 +121,24 @@ def match_lap_states(
     """
     index_map = match_laps(source, target)
     return [(source[i], target[j]) for i, j in index_map.items()]
+
+
+# ---------------------------------------------------------------------------
+# Arc-length utility
+# ---------------------------------------------------------------------------
+
+def _arc_length(states: list[CarState]) -> np.ndarray:
+    """Return cumulative arc-length (m) along the lap using XY distance."""
+    n = len(states)
+    if n == 0:
+        return np.array([], dtype=float)
+
+    arc = np.zeros(n, dtype=float)
+    for i in range(1, n):
+        dx = states[i].x - states[i - 1].x
+        dy = states[i].y - states[i - 1].y
+        arc[i] = arc[i - 1] + math.hypot(dx, dy)
+    return arc
 
 
 # ---------------------------------------------------------------------------
