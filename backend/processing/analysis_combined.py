@@ -10,13 +10,15 @@ from backend.processing.steering_analysis import SteeringRecommendation, detect_
 import sys
 
 
-def get_all_recommendations(show: bool) -> list[ThrottleBoundaryIssue | ThrottleLevelIssue | BrakeBoundaryIssue | BrakeLevelIssue | SteeringRecommendation]:
+def get_all_recommendations(file_fast: str, file_good: str, show: bool = False) -> list[ThrottleBoundaryIssue | ThrottleLevelIssue | BrakeBoundaryIssue | BrakeLevelIssue | SteeringRecommendation]:
 
     # load
-    print("Loading reference (fast) lap …")
-    ref_states = LapDataParser("data/hackathon/hackathon_fast_laps.mcap").get_lap_data()
-    print("Loading slow lap …")
-    slow_states = LapDataParser("data/hackathon/hackathon_good_lap.mcap").get_lap_data()
+    if show:
+        print("Loading reference (fast) lap …")
+    ref_states = LapDataParser(file_fast).get_lap_data()
+    if show:
+        print("Loading slow lap …")
+    slow_states = LapDataParser(file_good).get_lap_data()
     ref_states, slow_states = align_laps(ref_states, slow_states)
 
 
@@ -25,8 +27,9 @@ def get_all_recommendations(show: bool) -> list[ThrottleBoundaryIssue | Throttle
     slow_count = len(slow_states)
     ref_states = filter_arc_jumps(ref_states)
     slow_states = filter_arc_jumps(slow_states)
-    print(f"{ref_count - len(ref_states)} ref points discarded")
-    print(f"{slow_count - len(slow_states)} slot points discarded")
+    if show:
+        print(f"{ref_count - len(ref_states)} ref points discarded")
+        print(f"{slow_count - len(slow_states)} slot points discarded")
 
     save = sys.argv[1] if len(sys.argv) > 1 else None
 
