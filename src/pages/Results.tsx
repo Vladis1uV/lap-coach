@@ -1,14 +1,35 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
-import { ArrowLeft, FileText, Layers } from "lucide-react";
+import { ArrowLeft, FileText, Gauge, Footprints, Navigation } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import Navbar from "@/components/Navbar";
+
+interface Recommendation {
+  recommendation: string;
+  verdict: string;
+  arc_start?: number;
+  arc_end?: number;
+  mean_delta?: number;
+  offset_m?: number;
+  category: "throttle" | "brake" | "steering" | "other";
+}
+
+interface ResultsData {
+  recommendations: Recommendation[];
+}
+
+const categoryConfig = {
+  throttle: { label: "Throttle", icon: Gauge, color: "text-green-400", border: "border-green-500/30" },
+  brake: { label: "Brake", icon: Footprints, color: "text-red-400", border: "border-red-500/30" },
+  steering: { label: "Steering", icon: Navigation, color: "text-blue-400", border: "border-blue-500/30" },
+  other: { label: "Other", icon: FileText, color: "text-muted-foreground", border: "border-border" },
+};
 
 const Results = () => {
   const navigate = useNavigate();
-  const [data, setData] = useState<Record<string, unknown> | null>(null);
+  const [data, setData] = useState<ResultsData | null>(null);
 
   useEffect(() => {
     const raw = sessionStorage.getItem("lapResults");
@@ -27,7 +48,7 @@ const Results = () => {
               <FileText className="w-7 h-7 text-primary" />
             </div>
             <h2 className="text-2xl font-bold mb-3">No results yet</h2>
-            <p className="text-muted-foreground mb-8">Upload an MCAP file on the home page to see your analysis here.</p>
+            <p className="text-muted-foreground mb-8">Upload your MCAP files on the home page to see analysis here.</p>
             <Button onClick={() => navigate("/")} variant="outline" className="gap-2">
               <ArrowLeft className="w-4 h-4" /> Back to Upload
             </Button>
@@ -36,6 +57,14 @@ const Results = () => {
       </div>
     );
   }
+
+  const { recommendations } = data;
+  const grouped = {
+    throttle: recommendations.filter((r) => r.category === "throttle"),
+    brake: recommendations.filter((r) => r.category === "brake"),
+    steering: recommendations.filter((r) => r.category === "steering"),
+    other: recommendations.filter((r) => r.category === "other"),
+  };
 
   return (
     <div className="min-h-screen bg-background">
@@ -46,44 +75,45 @@ const Results = () => {
             <Button onClick={() => navigate("/")} variant="ghost" size="sm" className="gap-2 mb-6 text-muted-foreground">
               <ArrowLeft className="w-4 h-4" /> New Analysis
             </Button>
-
-            <h1 className="text-3xl font-bold mb-2">Analysis Results</h1>
-            <p className="text-muted-foreground mb-8">Here's what we found in your telemetry data.</p>
+            <h1 className="text-3xl font-bold mb-2">Coaching Recommendations</h1>
+            <p className="text-muted-foreground mb-8">
+              {recommendations.length} suggestions to improve your lap time.
+            </p>
           </motion.div>
 
-          <div className="grid md:grid-cols-2 gap-6">
-            {/* Summary card */}
-            <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1 }}>
-              <Card className="bg-card border-border">
-                <CardHeader>
-                  <div className="flex items-center gap-3">
-                    <div className="w-9 h-9 rounded-lg gradient-glow flex items-center justify-center">
-                      <Layers className="w-4 h-4 text-primary" />
-                    </div>
-                    <div>
-                      <CardTitle className="text-lg">Data Summary</CardTitle>
-                      <CardDescription>Raw processing output</CardDescription>
-                    </div>
-                  </div>
-                </CardHeader>
-                <CardContent>
-                  <pre className="text-xs font-mono bg-muted/50 rounded-xl p-4 overflow-auto max-h-80 text-muted-foreground">
-                    {JSON.stringify(data, null, 2)}
-                  </pre>
-                </CardContent>
-              </Card>
-            </motion.div>
+          {(["throttle", "brake", "steering", "other"] as const).map((cat) => {
+            const items = grouped[cat];
+            if (items.length === 0) return null;
+            const cfg = categoryConfig[cat];
+            const Icon = cfg.icon;
 
-            {/* Placeholder for future analysis */}
-            <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }}>
-              <Card className="bg-card border-border border-dashed flex items-center justify-center min-h-[280px]">
-                <div className="text-center p-6">
-                  <p className="text-muted-foreground text-sm">Charts & coaching suggestions will appear here</p>
-                  <p className="text-xs text-muted-foreground/60 mt-1">Coming soon</p>
+            return (
+              <motion.div key={cat} initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} className="mb-8">
+                <div className="flex items-center gap-2 mb-4">
+                  <Icon className={`w-5 h-5 ${cfg.color}`} />
+                  <h2 className="text-xl font-semibold">{cfg.label}</h2>
+                  <span className="text-xs text-muted-foreground ml-1">({items.length})</span>
                 </div>
-              </Card>
-            </motion.div>
-          </div>
+                <div className="space-y-3">
+                  {items.map((rec, i) => (
+                    <Card key={i} className={`bg-card ${cfg.border} border`}>
+                      <CardContent className="p-4">
+                        <p className="text-sm text-foreground leading-relaxed">{rec.recommendation}</p>
+                        <div className="flex flex-wrap gap-3 mt-2 text-xs text-muted-foreground font-mono">
+                          {rec.arc_start != null && rec.arc_end != null && (
+                            <span>{rec.arc_start} m – {rec.arc_end} m</span>
+                          )}
+                          {rec.offset_m != null && <span>offset: {rec.offset_m} m</span>}
+                          {rec.mean_delta != null && <span>Δ: {rec.mean_delta}</span>}
+                          <span className="opacity-60">{rec.verdict}</span>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  ))}
+                </div>
+              </motion.div>
+            );
+          })}
         </div>
       </div>
     </div>
