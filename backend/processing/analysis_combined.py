@@ -103,8 +103,15 @@ def get_all_recommendations(file_fast: str, file_good: str, show: bool = False) 
             brake_level_issues,
         )
 
-    return []
+    all_recs = []
+    all_recs.extend(steering_recommendations)
+    all_recs.extend(gas_boundary_issues)
+    all_recs.extend(gas_level_issues)
+    all_recs.extend(brake_boundary_issues)
+    all_recs.extend(brake_level_issues)
+    return all_recs
 
 
 if __name__ == "__main__":
-    get_all_recommendations(True)
+    recs = get_all_recommendations("data/hackathon/hackathon_fast_laps.mcap", "data/hackathon/hackathon_good_lap.mcap", show=True)
+    print(f"\nTotal recommendations: {len(recs)}")

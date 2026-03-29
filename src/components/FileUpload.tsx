@@ -12,128 +12,139 @@ interface FileUploadProps {
 type UploadState = "idle" | "selected" | "uploading" | "error";
 
 const FileUpload = ({ onFileProcessed, apiUrl = "http://localhost:8000" }: FileUploadProps) => {
-  const [file, setFile] = useState<File | null>(null);
+  const [fastFile, setFastFile] = useState<File | null>(null);
+  const [goodFile, setGoodFile] = useState<File | null>(null);
   const [state, setState] = useState<UploadState>("idle");
-  const [dragOver, setDragOver] = useState(false);
+  const [dragOver, setDragOver] = useState<"fast" | "good" | null>(null);
   const [error, setError] = useState("");
 
-  const handleFile = useCallback((f: File) => {
+  const validateFile = (f: File): boolean => {
     if (!f.name.endsWith(".mcap")) {
       setError("Please upload a .mcap file");
       setState("error");
-      return;
+      return false;
     }
-    setFile(f);
-    setState("selected");
     setError("");
-  }, []);
-
-  const onDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      setDragOver(false);
-      if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
-    },
-    [handleFile]
-  );
-
-  const onInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files?.[0]) handleFile(e.target.files[0]);
+    return true;
   };
 
+  const handleFastFile = useCallback((f: File) => {
+    if (!validateFile(f)) return;
+    setFastFile(f);
+    if (state === "error") setState("idle");
+  }, [state]);
+
+  const handleGoodFile = useCallback((f: File) => {
+    if (!validateFile(f)) return;
+    setGoodFile(f);
+    if (state === "error") setState("idle");
+  }, [state]);
+
+  const bothSelected = fastFile && goodFile;
+
   const handleUpload = async () => {
-    if (!file) return;
+    if (!fastFile || !goodFile) return;
     setState("uploading");
     try {
       const formData = new FormData();
-      formData.append("file", file);
+      formData.append("file_fast", fastFile);
+      formData.append("file_good", goodFile);
       const res = await fetch(`${apiUrl}/api/process`, {
         method: "POST",
         body: formData,
       });
       if (!res.ok) throw new Error(`Server error: ${res.status}`);
       const data = await res.json();
-      onFileProcessed(data.result);
+      onFileProcessed(data);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed");
       setState("error");
     }
   };
 
-  return (
-    <div className="w-full max-w-xl mx-auto">
+  const DropZone = ({
+    label,
+    file,
+    onFile,
+    dragId,
+  }: {
+    label: string;
+    file: File | null;
+    onFile: (f: File) => void;
+    dragId: "fast" | "good";
+  }) => {
+    const inputId = `mcap-input-${dragId}`;
+    return (
       <motion.div
-        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-        onDragLeave={() => setDragOver(false)}
-        onDrop={onDrop}
+        onDragOver={(e) => { e.preventDefault(); setDragOver(dragId); }}
+        onDragLeave={() => setDragOver(null)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragOver(null);
+          if (e.dataTransfer.files[0]) onFile(e.dataTransfer.files[0]);
+        }}
+        onClick={() => {
+          if (state !== "uploading") document.getElementById(inputId)?.click();
+        }}
         className={cn(
-          "relative rounded-2xl border-2 border-dashed p-10 text-center transition-colors cursor-pointer",
-          dragOver
+          "relative rounded-2xl border-2 border-dashed p-8 text-center transition-colors cursor-pointer flex-1 min-w-[240px]",
+          dragOver === dragId
             ? "border-primary bg-primary/5"
-            : state === "error"
-            ? "border-destructive/50 bg-destructive/5"
-            : state === "selected"
+            : file
             ? "border-primary/50 bg-primary/5"
             : "border-border hover:border-muted-foreground/40"
         )}
         whileHover={{ scale: 1.01 }}
-        onClick={() => {
-          if (state !== "uploading") document.getElementById("mcap-input")?.click();
-        }}
       >
         <input
-          id="mcap-input"
+          id={inputId}
           type="file"
           accept=".mcap"
           className="hidden"
-          onChange={onInputChange}
+          onChange={(e) => { if (e.target.files?.[0]) onFile(e.target.files[0]); }}
         />
-
-        <AnimatePresence mode="wait">
-          {state === "idle" && (
-            <motion.div key="idle" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex flex-col items-center gap-3">
-              <div className="w-16 h-16 rounded-2xl gradient-glow flex items-center justify-center">
-                <Upload className="w-7 h-7 text-primary" />
-              </div>
-              <p className="text-lg font-medium text-foreground">Drop your MCAP file here</p>
-              <p className="text-sm text-muted-foreground">or click to browse · .mcap files only</p>
-            </motion.div>
-          )}
-
-          {state === "selected" && file && (
-            <motion.div key="selected" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="flex flex-col items-center gap-3">
-              <div className="w-16 h-16 rounded-2xl bg-primary/10 flex items-center justify-center">
-                <FileCheck className="w-7 h-7 text-primary" />
-              </div>
-              <p className="text-lg font-medium text-foreground">{file.name}</p>
-              <p className="text-sm text-muted-foreground">{(file.size / 1024 / 1024).toFixed(1)} MB</p>
-            </motion.div>
-          )}
-
-          {state === "uploading" && (
-            <motion.div key="uploading" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex flex-col items-center gap-3">
-              <Loader2 className="w-10 h-10 text-primary animate-spin" />
-              <p className="text-lg font-medium text-foreground">Processing...</p>
-              <p className="text-sm text-muted-foreground">Analyzing your lap data</p>
-            </motion.div>
-          )}
-
-          {state === "error" && (
-            <motion.div key="error" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex flex-col items-center gap-3">
-              <div className="w-16 h-16 rounded-2xl bg-destructive/10 flex items-center justify-center">
-                <AlertCircle className="w-7 h-7 text-destructive" />
-              </div>
-              <p className="text-lg font-medium text-foreground">Something went wrong</p>
-              <p className="text-sm text-destructive">{error}</p>
-              <p className="text-xs text-muted-foreground mt-1">Click to try again</p>
-            </motion.div>
-          )}
-        </AnimatePresence>
+        {file ? (
+          <div className="flex flex-col items-center gap-2">
+            <FileCheck className="w-6 h-6 text-primary" />
+            <p className="text-sm font-medium text-foreground truncate max-w-full">{file.name}</p>
+            <p className="text-xs text-muted-foreground">{(file.size / 1024 / 1024).toFixed(1)} MB</p>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center gap-2">
+            <Upload className="w-6 h-6 text-muted-foreground" />
+            <p className="text-sm font-medium text-foreground">{label}</p>
+            <p className="text-xs text-muted-foreground">Drop .mcap or click to browse</p>
+          </div>
+        )}
       </motion.div>
+    );
+  };
 
-      {state === "selected" && (
+  return (
+    <div className="w-full max-w-2xl mx-auto">
+      <div className="flex flex-col sm:flex-row gap-4">
+        <DropZone label="Fast (Reference) Lap" file={fastFile} onFile={handleFastFile} dragId="fast" />
+        <DropZone label="Good Lap (to tune)" file={goodFile} onFile={handleGoodFile} dragId="good" />
+      </div>
+
+      <AnimatePresence>
+        {state === "uploading" && (
+          <motion.div key="uploading" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="mt-6 flex flex-col items-center gap-2">
+            <Loader2 className="w-8 h-8 text-primary animate-spin" />
+            <p className="text-sm text-muted-foreground">Analyzing your laps...</p>
+          </motion.div>
+        )}
+        {state === "error" && (
+          <motion.div key="error" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="mt-6 flex flex-col items-center gap-2">
+            <AlertCircle className="w-6 h-6 text-destructive" />
+            <p className="text-sm text-destructive">{error}</p>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {bothSelected && state !== "uploading" && (
         <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="mt-6 flex justify-center">
-          <Button size="lg" onClick={(e) => { e.stopPropagation(); handleUpload(); }} className="px-8 font-semibold text-base">
+          <Button size="lg" onClick={handleUpload} className="px-8 font-semibold text-base">
             Analyze Lap Data
           </Button>
         </motion.div>
