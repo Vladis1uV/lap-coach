@@ -15,7 +15,8 @@ const Index = () => {
   const navigate = useNavigate();
 
   const handleProcessed = (data: unknown) => {
-    sessionStorage.setItem("lapResults", JSON.stringify(data));
+    const withUrl = { ...(data as Record<string, unknown>), apiUrl: "http://localhost:8000" };
+    sessionStorage.setItem("lapResults", JSON.stringify(withUrl));
     navigate("/results");
   };
 
