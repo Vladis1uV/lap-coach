@@ -18,12 +18,11 @@ A racing lap analysis tool that compares two MCAP telemetry recordings — a **f
 ├── backend/            # FastAPI server + Python analysis
 │   ├── main.py         # API endpoints (/api/process, /api/health)
 │   ├── requirements.txt
-│   └── processing/     # Analysis modules
-│       ├── parser.py
-│       ├── gas_analysis.py
-│       ├── brake_analysis.py
-│       ├── steering_analysis.py
-│       └── analysis_combined.py
+│   ├── parser.py
+│   ├── gas_analysis.py
+│   ├── brake_analysis.py
+│   ├── steering_analysis.py
+│   └── analysis_combined.py
 ├── src/                # React + Vite frontend
 ├── data/               # Local telemetry data (git-ignored)
 └── README.md
@@ -45,7 +44,7 @@ cd backend
 python -m venv venv
 source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+python -m uvicorn main:app --reload --port 8000
 ```
 
 Verify: `http://localhost:8000/api/health` → `{"status": "ok"}`
