@@ -219,7 +219,7 @@ class BrakeBoundaryIssue:
 
 
 
-def _build_boundary_events(
+def _brake_build_boundary_events(
     ref_plateaus: list[BrakePlateau],
     slow_plateaus: list[BrakePlateau],
 ) -> list[PlateauBoundaryEvent]:
@@ -991,7 +991,7 @@ if __name__ == "__main__":
     for pl in slow_plateaus:
         print(f"{pl.start_arc} - {pl.end_arc}: {pl.mean_brake}")
 
-    events = _build_boundary_events(ref_plateaus, slow_plateaus)
+    events = _brake_build_boundary_events(ref_plateaus, slow_plateaus)
 
     boundary_issues = analyze_brake_boundaries(
         ref_plateaus,

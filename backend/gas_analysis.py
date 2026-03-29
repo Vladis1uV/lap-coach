@@ -219,7 +219,7 @@ class ThrottleBoundaryIssue:
 
 
 
-def _build_boundary_events(
+def _gas_build_boundary_events(
     ref_plateaus: list[ThrottlePlateau],
     slow_plateaus: list[ThrottlePlateau],
 ) -> list[PlateauBoundaryEvent]:
@@ -982,7 +982,7 @@ if __name__ == "__main__":
     for pl in slow_plateaus:
         print(f"{pl.start_arc} - {pl.end_arc}")
 
-    events = _build_boundary_events(ref_plateaus, slow_plateaus)
+    events = _gas_build_boundary_events(ref_plateaus, slow_plateaus)
 
     boundary_issues = analyze_throttle_boundaries(
         ref_plateaus,

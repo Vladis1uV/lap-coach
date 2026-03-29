@@ -2,7 +2,7 @@ import tempfile
 import os
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from processing.analysis_combined import get_all_recommendations
+from analysis_combined import get_all_recommendations
 
 app = FastAPI(title="Lap Coach API")
 

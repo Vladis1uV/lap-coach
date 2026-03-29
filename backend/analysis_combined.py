@@ -1,11 +1,11 @@
-from backend.processing import gas_analysis, brake_analysis
-from backend.processing.brake_analysis import BrakeBoundaryIssue, BrakeLevelIssue, detect_brake_plateaus, \
-    analyze_brake_boundaries, analyze_brake_levels_in_mutual_plateaus, print_brake_recommendations, plot_brake_analysis
-from backend.processing.gas_analysis import ThrottleBoundaryIssue, ThrottleLevelIssue, detect_throttle_plateaus, \
+from brake_analysis import BrakeBoundaryIssue, BrakeLevelIssue, detect_brake_plateaus, \
+    analyze_brake_boundaries, analyze_brake_levels_in_mutual_plateaus, print_brake_recommendations, plot_brake_analysis, \
+    _brake_build_boundary_events
+from gas_analysis import ThrottleBoundaryIssue, ThrottleLevelIssue, detect_throttle_plateaus, \
     analyze_throttle_boundaries, analyze_throttle_levels_in_mutual_plateaus, print_gas_recommendations, \
-    plot_gas_analysis
-from backend.processing.parser import LapDataParser, align_laps, filter_arc_jumps
-from backend.processing.steering_analysis import SteeringRecommendation, detect_steering_offsets, \
+    plot_gas_analysis, _gas_build_boundary_events
+from parser import LapDataParser, align_laps, filter_arc_jumps
+from steering_analysis import SteeringRecommendation, detect_steering_offsets, \
     group_steering_offsets, print_steering_recommendations, plot_steering_analysis
 import sys
 
@@ -55,7 +55,7 @@ def get_all_recommendations(file_fast: str, file_good: str, show: bool = False) 
     # gas
     ref_plateaus = detect_throttle_plateaus(ref_states)
     slow_plateaus = detect_throttle_plateaus(slow_states)
-    events = gas_analysis._build_boundary_events(ref_plateaus, slow_plateaus)
+    events = _gas_build_boundary_events(ref_plateaus, slow_plateaus)
     gas_boundary_issues = analyze_throttle_boundaries(
         ref_plateaus,
         slow_plateaus,
@@ -81,7 +81,7 @@ def get_all_recommendations(file_fast: str, file_good: str, show: bool = False) 
     # brake
     ref_plateaus = detect_brake_plateaus(ref_states)
     slow_plateaus = detect_brake_plateaus(slow_states)
-    events = brake_analysis._build_boundary_events(ref_plateaus, slow_plateaus)
+    events = _brake_build_boundary_events(ref_plateaus, slow_plateaus)
     brake_boundary_issues = analyze_brake_boundaries(
         ref_plateaus,
         slow_plateaus,
