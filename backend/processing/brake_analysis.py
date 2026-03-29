@@ -1,32 +1,42 @@
 """
 brake_analysis.py
-=================
-Brake-event detection and lap comparison.
+===============
+Threshold-based brake plateau analysis for lap comparison.
 
-Brake pressure is a *spike* signal — sharp application, hold, release.
-The meaningful events are:
+New logic
+---------
+We use a single global threshold for "brake is applied".
 
-  - **BrakeEvent**: a single braking zone, characterised by:
-      · entry_arc  — where pressure crosses a threshold going up (brake point)
-      · peak_arc   — maximum pressure (peak braking)
-      · exit_arc   — where pressure falls back below threshold (release)
-      · peak_value — normalised peak pressure (0–1)
-      · duration_m — length of the braking zone in metres
+A brake plateau is defined as a contiguous region where:
+    brake >= applied_threshold
 
-Detection works on a **signal normalised to [0, 1]** within each lap so that
-thresholds are scale-independent regardless of whether the raw signal is in
-Pascals, bar, or a 0-1 CAN value.
+Events are derived from plateau boundaries:
+  - plateau start: brake crosses threshold upward
+  - plateau end:   brake crosses threshold downward
 
-Plots (separate figures / axes):
-  1. Brake pressure — reference vs slow, with event markers and search windows
-  2. Speed         — reference vs slow (context for braking zones)
-  3. Steering      — reference vs slow (shows what driver does mid-brake)
+Comparison categories
+---------------------
+1. Timing misalignment
+   Both laps contain the same plateau region in essence, but one starts and/or
+   ends earlier/later than the reference.
+
+2. Structural mismatch
+   One lap contains a plateau where the other does not:
+   - extra plateau in slow lap
+   - missing plateau in slow lap
+   - slow lap stops applying brake while reference still pushes
+   - slow lap applies brake while reference does not
+
+3. Level mismatch
+   Both laps contain the plateau, but the brake level inside it differs
+   materially (mean / peak level too low or too high).
 
 Public API
 ----------
-    detect_brake_events(states, arc, **kwargs) -> list[BrakeEvent]
-    match_brake_events(ref, slow, ...)         -> list[BrakeMatch]
-    print_brake_recommendations(matches)
+    detect_brake_plateaus(states, arc, **kwargs) -> list[BrakePlateau]
+    match_brake_plateaus(ref, slow, **kwargs)    -> list[BrakePlateauMatch]
+    find_extra_slow_plateaus(ref, slow, **kwargs)   -> list[BrakePlateau]
+    print_brake_recommendations(matches, extra_slow)
     plot_brake_analysis(...)
 
 Dependencies: numpy, scipy, matplotlib
@@ -34,533 +44,903 @@ Dependencies: numpy, scipy, matplotlib
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from enum import Enum, auto
 
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import uniform_filter1d
-from scipy.signal import find_peaks
-
-from parser import LapDataParser, _arc_length, align_laps
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_channel(states: list, attr: str) -> np.ndarray:
-    return np.array([getattr(s, attr) for s in states])
-
-
-def _smooth(signal: np.ndarray, window: int = 9) -> np.ndarray:
+def _smooth(signal: np.ndarray, window: int = 5) -> np.ndarray:
+    """Uniform smoothing to reduce sensor noise before thresholding."""
     return uniform_filter1d(signal.astype(float), size=max(1, window))
 
 
-def _normalise(signal: np.ndarray) -> tuple[np.ndarray, float]:
-    """Return (signal / max, max).  max is stored so raw values can be reported."""
-    peak = float(signal.max())
-    if peak < 1e-9:
-        return signal.copy(), 1.0
-    return signal / peak, peak
-
-
-def _arc_to_samples(arc: np.ndarray, metres: float) -> int:
+def _arc_to_sample_distance(arc: np.ndarray, metres: float) -> int:
+    """Convert a spatial distance in metres to an approximate sample count."""
     if len(arc) < 2 or arc[-1] <= arc[0]:
         return 1
-    avg = (arc[-1] - arc[0]) / (len(arc) - 1)
-    return max(1, int(metres / avg))
+    avg_spacing = (arc[-1] - arc[0]) / (len(arc) - 1)
+    return max(1, int(metres / avg_spacing))
 
 
 # ---------------------------------------------------------------------------
-# BrakeEvent dataclass
+# Data model
 # ---------------------------------------------------------------------------
 
 @dataclass
-class BrakeEvent:
-    """A single braking zone."""
-    # Indices into the states list
-    entry_idx: int
-    peak_idx:  int
-    exit_idx:  int
+class BrakePlateau:
+    """
+    A contiguous region where brake is considered applied.
 
-    # Arc-length positions (m)
-    entry_arc:  float
-    peak_arc:   float
-    exit_arc:   float
-    duration_m: float   # exit_arc - entry_arc
-
-    # Normalised (0–1) values
-    peak_norm:  float   # peak pressure, normalised
-
-    # Track position
-    x_entry: float
-    y_entry: float
-    x_peak:  float
-    y_peak:  float
+    Start is the first sample where brake crosses the threshold upward.
+    End is the last consecutive sample before it falls below threshold.
+    """
+    start_idx: int
+    end_idx: int
+    start_arc: float
+    end_arc: float
+    duration_m: float
+    mean_brake: float
+    peak_brake: float
+    x_start: float
+    y_start: float
+    x_end: float
+    y_end: float
 
 
 # ---------------------------------------------------------------------------
 # Detection
 # ---------------------------------------------------------------------------
-
-def detect_brake_events(
+def detect_brake_plateaus(
     states: list,
-    arc: np.ndarray,
     *,
-    # All thresholds operate on the 0-1 normalised signal
-    entry_threshold: float  = 0.15,   # normalised pressure to call "braking started"
-    peak_min:        float  = 0.35,   # minimum normalised peak to count as an event
-    prominence:      float  = 0.25,   # how much the peak must stand out
-    min_gap_m:       float  = 40.0,   # minimum metres between two events
-    walk_limit_m:    float  = 80.0,   # max metres to walk back/forward from peak
-    smooth_window:   int    = 11,     # pre-smoothing (removes sensor buzz)
-) -> list[BrakeEvent]:
+    applied_threshold: float = 0.01,
+    min_duration_m: float = 0.0,
+    merge_gap_m: float = 10.0,
+    smooth_window: int = 7,
+) -> list[BrakePlateau]:
     """
-    Detect braking zones from a (possibly raw-unit) brake signal.
+    Detect threshold-based brake plateaus.
 
-    The signal is normalised to [0, 1] before any threshold is applied, so
-    all parameters are scale-independent.
+    Plateau = contiguous region where brake >= applied_threshold.
 
-    Algorithm
-    ---------
-    1. Smooth → normalise → find peaks (scipy).
-    2. For each peak walk backward to entry_threshold → entry point.
-    3. Walk forward to entry_threshold → exit point.
-    4. Enforce min_gap between events.
+    This version correctly handles edge plateaus:
+    - if brake starts above threshold, a plateau begins at index 0
+    - if brake ends above threshold, the plateau ends at the last index
     """
-    raw = _get_channel(states, "brake")
-    smoothed = _smooth(raw, smooth_window)
-    norm, _scale = _normalise(smoothed)
+    if not states:
+        return []
 
-    min_gap_s  = _arc_to_samples(arc, min_gap_m)
-    walk_lim   = _arc_to_samples(arc, walk_limit_m)
-    n          = len(norm)
+    brake = _smooth(np.array([s.brake for s in states]), smooth_window)
+    # brake = np.array([s.brake for s in states])
+    mask = brake >= applied_threshold
+    n = len(mask)
 
-    peak_indices, _ = find_peaks(
-        norm,
-        height=peak_min,
-        prominence=prominence,
-        distance=min_gap_s,
-    )
+    # Find contiguous True runs, including ones that start at 0 or end at n-1
+    runs: list[tuple[int, int]] = []
+    start: int | None = 0 if mask[0] else None
 
-    events: list[BrakeEvent] = []
+    for i in range(1, n):
+        # False -> True : plateau starts at i
+        if not mask[i - 1] and mask[i]:
+            start = i
+        # True -> False : plateau ends at i-1
+        elif mask[i - 1] and not mask[i]:
+            if start is not None:
+                runs.append((start, i - 1))
+                start = None
 
-    for pi in peak_indices:
-        # Walk backward → entry
-        entry_idx = pi
-        for k in range(pi - 1, max(0, pi - walk_lim) - 1, -1):
-            if norm[k] < entry_threshold:
-                entry_idx = k
-                break
+    # If still inside a plateau at the end, close it at the last sample
+    if start is not None:
+        runs.append((start, n - 1))
+
+    if not runs:
+        return []
+
+    # Merge runs separated by very short gaps
+    merged: list[tuple[int, int]] = [runs[0]]
+    for s, e in runs[1:]:
+        prev_s, prev_e = merged[-1]
+        gap_m = float(states[s].arc - states[prev_e].arc)
+        if gap_m <= merge_gap_m:
+            merged[-1] = (prev_s, e)
         else:
-            entry_idx = max(0, pi - walk_lim)
+            merged.append((s, e))
 
-        # Walk forward → exit
-        exit_idx = pi
-        for k in range(pi + 1, min(n, pi + walk_lim)):
-            if norm[k] < entry_threshold:
-                exit_idx = k
-                break
-        else:
-            exit_idx = min(n - 1, pi + walk_lim)
+    plateaus: list[BrakePlateau] = []
+    for s, e in merged:
+        duration = float(states[e].arc - states[s].arc)
+        if duration < min_duration_m:
+            continue
 
-        events.append(BrakeEvent(
-            entry_idx  = int(entry_idx),
-            peak_idx   = int(pi),
-            exit_idx   = int(exit_idx),
-            entry_arc  = float(arc[entry_idx]),
-            peak_arc   = float(arc[pi]),
-            exit_arc   = float(arc[exit_idx]),
-            duration_m = float(arc[exit_idx] - arc[entry_idx]),
-            peak_norm  = float(norm[pi]),
-            x_entry    = states[entry_idx].x,
-            y_entry    = states[entry_idx].y,
-            x_peak     = states[pi].x,
-            y_peak     = states[pi].y,
+        seg = brake[s:e + 1]
+        plateaus.append(BrakePlateau(
+            start_idx=s,
+            end_idx=e,
+            start_arc=float(states[s].arc),
+            end_arc=float(states[e].arc),
+            duration_m=duration,
+            mean_brake=float(seg.mean()),
+            peak_brake=float(seg.max()),
+            x_start=states[s].x,
+            y_start=states[s].y,
+            x_end=states[e].x,
+            y_end=states[e].y,
         ))
 
+    return plateaus
+
+
+# ---------------------------------------------------------------------------
+# Matching / comparison of plateaus
+# ---------------------------------------------------------------------------
+
+class PlateauVerdict(Enum):
+    MATCHED = auto()
+
+    START_TOO_LATE = auto()
+    START_TOO_EARLY = auto()
+    END_TOO_LATE = auto()
+    END_TOO_EARLY = auto()
+
+    LEVEL_TOO_LOW = auto()
+    LEVEL_TOO_HIGH = auto()
+
+    MISSING = auto()
+    EXTRA = auto()
+    SPLIT = auto()
+    MERGED = auto()
+
+
+@dataclass
+class PlateauBoundaryEvent:
+    arc: float
+    source: str            # "ref" | "slow"
+    kind: str              # "start" | "end"
+    plateau: BrakePlateau
+
+
+@dataclass
+class BrakeBoundaryIssue:
+    verdict: PlateauVerdict
+    ref: BrakePlateau | None
+    slow: BrakePlateau | None
+    arc_start: float
+    arc_end: float
+    offset_m: float | None
+    recommendation: str
+
+
+
+def _build_boundary_events(
+    ref_plateaus: list[BrakePlateau],
+    slow_plateaus: list[BrakePlateau],
+) -> list[PlateauBoundaryEvent]:
+    events: list[PlateauBoundaryEvent] = []
+
+    for p in ref_plateaus:
+        events.append(PlateauBoundaryEvent(
+            arc=p.start_arc, source="ref", kind="start", plateau=p
+        ))
+        events.append(PlateauBoundaryEvent(
+            arc=p.end_arc, source="ref", kind="end", plateau=p
+        ))
+
+    for p in slow_plateaus:
+        events.append(PlateauBoundaryEvent(
+            arc=p.start_arc, source="slow", kind="start", plateau=p
+        ))
+        events.append(PlateauBoundaryEvent(
+            arc=p.end_arc, source="slow", kind="end", plateau=p
+        ))
+
+    # End before start at the same location, to make short lift/reapply behavior cleaner.
+    kind_order = {"end": 0, "start": 1}
+    src_order = {"ref": 0, "slow": 1}
+
+    events.sort(key=lambda e: (e.arc, kind_order[e.kind], src_order[e.source]))
     return events
 
 
+
+def analyze_brake_boundaries(
+    ref_plateaus: list[BrakePlateau],
+    slow_plateaus: list[BrakePlateau],
+    events: list[PlateauBoundaryEvent],
+    *,
+    timing_window_m: float = 12.0,
+    timing_tolerance_m: float = 3.0,
+    min_struct_gap_m: float = 2.0,
+    level_mean_tol: float = 0.10,
+    level_peak_tol: float = 0.12,
+) -> list[BrakeBoundaryIssue]:
+    """
+    Analyze brake plateaus by sweeping through a single sorted list of
+    plateau boundary events from both laps.
+
+    Pairwise logic on adjacent events:
+      ref start -> slow start   => MATCHED / START_TOO_LATE
+      slow start -> ref start   => MATCHED / START_TOO_EARLY
+      ref end   -> slow end     => MATCHED / END_TOO_LATE
+      slow end  -> ref end      => MATCHED / END_TOO_EARLY
+
+      slow start -> slow end, while ref inactive  => EXTRA
+      ref  start -> ref  end, while slow inactive => MISSING
+
+      slow end -> slow start, while ref active => SPLIT
+      ref  end -> ref  start, while slow active => MERGED
+
+    A same-kind cross-source boundary pair is considered MATCHED if the boundary
+    distance is <= timing_tolerance_m.
+    """
+    if len(events) < 2:
+        return []
+
+    issues: list[BrakeBoundaryIssue] = []
+
+    # Active state in the open interval (e1.arc, e2.arc), after applying e1
+    ref_active = False
+    slow_active = False
+
+    for i in range(len(events) - 1):
+        e1 = events[i]
+        e2 = events[i + 1]
+
+        # Apply e1 so active flags describe the interval after e1
+        if e1.source == "ref":
+            ref_active = (e1.kind == "start")
+        else:
+            slow_active = (e1.kind == "start")
+
+        gap = float(e2.arc - e1.arc)
+        struct_gap_ok = gap >= min_struct_gap_m
+
+        # ------------------------------------------------------------
+        # Timing / matched boundaries:
+        # same-kind, different-source, sufficiently close in arc
+        # ------------------------------------------------------------
+        if e1.kind == e2.kind and e1.source != e2.source and gap <= timing_window_m:
+            is_matched = gap <= timing_tolerance_m
+
+            if e1.kind == "start":
+                if e1.source == "ref" and e2.source == "slow":
+                    issues.append(BrakeBoundaryIssue(
+                        verdict=PlateauVerdict.MATCHED if is_matched else PlateauVerdict.START_TOO_LATE,
+                        ref=e1.plateau,
+                        slow=e2.plateau,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=gap,
+                        recommendation=(
+                            f"At ~{e1.arc:.0f} m your brake start matches the reference "
+                            f"well (offset {gap:.1f} m)."
+                            if is_matched else
+                            f"At ~{e1.arc:.0f} m the reference starts brake, but you start "
+                            f"at ~{e2.arc:.0f} m ({gap:.1f} m too late)."
+                        ),
+                    ))
+                elif e1.source == "slow" and e2.source == "ref":
+                    issues.append(BrakeBoundaryIssue(
+                        verdict=PlateauVerdict.MATCHED if is_matched else PlateauVerdict.START_TOO_EARLY,
+                        ref=e2.plateau,
+                        slow=e1.plateau,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=-gap,
+                        recommendation=(
+                            f"At ~{e2.arc:.0f} m your brake start matches the reference "
+                            f"well (offset {-gap:.1f} m)."
+                            if is_matched else
+                            f"You start brake at ~{e1.arc:.0f} m, before the reference "
+                            f"start at ~{e2.arc:.0f} m ({gap:.1f} m too early)."
+                        ),
+                    ))
+
+            else:  # end/end
+                if e1.source == "ref" and e2.source == "slow":
+                    issues.append(BrakeBoundaryIssue(
+                        verdict=PlateauVerdict.MATCHED if is_matched else PlateauVerdict.END_TOO_LATE,
+                        ref=e1.plateau,
+                        slow=e2.plateau,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=gap,
+                        recommendation=(
+                            f"At ~{e1.arc:.0f} m your brake end matches the reference "
+                            f"well (offset {gap:.1f} m)."
+                            if is_matched else
+                            f"At ~{e1.arc:.0f} m the reference ends brake, but you stay on "
+                            f"until ~{e2.arc:.0f} m ({gap:.1f} m too late)."
+                        ),
+                    ))
+                elif e1.source == "slow" and e2.source == "ref":
+                    issues.append(BrakeBoundaryIssue(
+                        verdict=PlateauVerdict.MATCHED if is_matched else PlateauVerdict.END_TOO_EARLY,
+                        ref=e2.plateau,
+                        slow=e1.plateau,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=-gap,
+                        recommendation=(
+                            f"At ~{e2.arc:.0f} m your brake end matches the reference "
+                            f"well (offset {-gap:.1f} m)."
+                            if is_matched else
+                            f"You end brake at ~{e1.arc:.0f} m, before the reference "
+                            f"end at ~{e2.arc:.0f} m ({gap:.1f} m too early)."
+                        ),
+                    ))
+
+        # ------------------------------------------------------------
+        # Structural mismatches: adjacent same-source events
+        # ------------------------------------------------------------
+        if e1.source == e2.source and struct_gap_ok:
+            # source start -> source end
+            if e1.kind == "start" and e2.kind == "end":
+                if e1.source == "slow" and not ref_active:
+                    issues.append(BrakeBoundaryIssue(
+                        verdict=PlateauVerdict.EXTRA,
+                        ref=None,
+                        slow=e1.plateau,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=None,
+                        recommendation=(
+                            f"Between {e1.arc:.0f}–{e2.arc:.0f} m you apply brake, "
+                            f"but the reference does not."
+                        ),
+                    ))
+                elif e1.source == "ref" and not slow_active:
+                    issues.append(BrakeBoundaryIssue(
+                        verdict=PlateauVerdict.MISSING,
+                        ref=e1.plateau,
+                        slow=None,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=None,
+                        recommendation=(
+                            f"Between {e1.arc:.0f}–{e2.arc:.0f} m the reference applies "
+                            f"brake, but you do not."
+                        ),
+                    ))
+
+            # source end -> source start
+            elif e1.kind == "end" and e2.kind == "start":
+                if e1.source == "slow" and ref_active:
+                    issues.append(BrakeBoundaryIssue(
+                        verdict=PlateauVerdict.SPLIT,
+                        ref=None,
+                        slow=e2.plateau,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=None,
+                        recommendation=(
+                            f"Between {e1.arc:.0f}–{e2.arc:.0f} m you lift and reapply "
+                            f"brake, while the reference stays on brake."
+                        ),
+                    ))
+                elif e1.source == "ref" and slow_active:
+                    issues.append(BrakeBoundaryIssue(
+                        verdict=PlateauVerdict.MERGED,
+                        ref=e2.plateau,
+                        slow=None,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=None,
+                        recommendation=(
+                            f"Between {e1.arc:.0f}–{e2.arc:.0f} the reference lifts and "
+                            f"reapplies brake, but you stay on brake continuously."
+                        ),
+                    ))
+
+    return issues
+
+_ISSUE_ICONS = {
+    PlateauVerdict.MATCHED: "✅",
+    PlateauVerdict.START_TOO_LATE: "⚠️ ",
+    PlateauVerdict.START_TOO_EARLY: "⚠️ ",
+    PlateauVerdict.END_TOO_LATE: "⚠️ ",
+    PlateauVerdict.END_TOO_EARLY: "⚠️ ",
+    PlateauVerdict.LEVEL_TOO_LOW: "⚠️ ",
+    PlateauVerdict.LEVEL_TOO_HIGH: "⚠️ ",
+    PlateauVerdict.MISSING: "❌",
+    PlateauVerdict.EXTRA: "⚠️ ",
+    PlateauVerdict.SPLIT: "⚠️ ",
+    PlateauVerdict.MERGED: "⚠️ ",
+}
+
+
+
 # ---------------------------------------------------------------------------
-# Verdicts
-# ---------------------------------------------------------------------------
-
-class EntryVerdict(Enum):
-    ON_TIME   = auto()
-    TOO_LATE  = auto()   # slow driver brakes later (carries more speed — or overshot)
-    TOO_EARLY = auto()   # slow driver brakes earlier than needed
-
-
-class PeakVerdict(Enum):
-    SIMILAR     = auto()
-    TOO_HARD    = auto()   # slow driver peaks higher (panic braking)
-    TOO_LIGHT   = auto()   # slow driver peaks lower (under-braking, trail-braking?)
-
-
-class ReleaseVerdict(Enum):
-    ON_TIME   = auto()
-    TOO_EARLY = auto()   # slow driver releases pressure before the corner
-    TOO_LATE  = auto()   # slow driver holds brakes too long into the corner
-
-
-# ---------------------------------------------------------------------------
-# BrakeMatch
+# Brake level analysis inside plateaus
 # ---------------------------------------------------------------------------
 
 @dataclass
-class BrakeMatch:
-    ref:  BrakeEvent
-    slow: BrakeEvent | None
-
-    entry_verdict:   EntryVerdict
-    peak_verdict:    PeakVerdict
-    release_verdict: ReleaseVerdict
-
-    entry_offset_m:   float   # slow.entry_arc  − ref.entry_arc
-    peak_offset_m:    float   # slow.peak_arc   − ref.peak_arc
-    release_offset_m: float   # slow.exit_arc   − ref.exit_arc
-    peak_norm_delta:  float   # slow.peak_norm  − ref.peak_norm
-
-    recommendations: list[str]
+class BrakeLevelIssue:
+    verdict: PlateauVerdict   # LEVEL_TOO_LOW or LEVEL_TOO_HIGH
+    arc_start: float
+    arc_end: float
+    mean_delta: float         # slow_brake - ref_brake over the region
+    recommendation: str
 
 
-# ---------------------------------------------------------------------------
-# Matching
-# ---------------------------------------------------------------------------
-
-def _nearest_event(
-    target_arc: float,
-    candidates: list[BrakeEvent],
-    radius_m: float,
-) -> BrakeEvent | None:
-    within = [e for e in candidates if abs(e.peak_arc - target_arc) <= radius_m]
-    return min(within, key=lambda e: abs(e.peak_arc - target_arc)) if within else None
-
-
-def match_brake_events(
-    ref_events:  list[BrakeEvent],
-    slow_events: list[BrakeEvent],
+def _merge_level_regions(
+    regions: list[tuple[float, float, str, float]],
     *,
-    on_time_window_m:  float = 10.0,
-    search_radius_m:   float = 80.0,
-    peak_norm_tol:     float = 0.10,   # normalised pressure difference tolerance
-) -> list[BrakeMatch]:
-    results: list[BrakeMatch] = []
+    merge_gap_m: float,
+) -> list[tuple[float, float, str, float]]:
+    """
+    Merge adjacent same-label regions separated by a small gap.
 
-    for ref in ref_events:
-        slow = _nearest_event(ref.peak_arc, slow_events, search_radius_m)
+    Each region is:
+        (start_arc, end_arc, label, mean_delta)
+    where label is "low" or "high".
+    """
+    if not regions:
+        return []
 
-        if slow is None:
-            results.append(BrakeMatch(
-                ref=ref, slow=None,
-                entry_verdict=EntryVerdict.TOO_LATE,
-                peak_verdict=PeakVerdict.SIMILAR,
-                release_verdict=ReleaseVerdict.ON_TIME,
-                entry_offset_m=float("nan"),
-                peak_offset_m=float("nan"),
-                release_offset_m=float("nan"),
-                peak_norm_delta=float("nan"),
-                recommendations=[
-                    f"At ~{ref.peak_arc:.0f} m no braking event found in the slow lap "
-                    f"(searched ±{search_radius_m:.0f} m). "
-                    f"The reference brakes here to {ref.peak_norm:.0%} — you may be "
-                    f"carrying too much speed or missing the braking zone entirely."
-                ],
-            ))
+    merged = [regions[0]]
+
+    for s, e, label, mean_delta in regions[1:]:
+        prev_s, prev_e, prev_label, prev_mean = merged[-1]
+        gap = s - prev_e
+
+        if label == prev_label and gap <= merge_gap_m:
+            # Weighted average by region length
+            prev_len = max(prev_e - prev_s, 1e-9)
+            curr_len = max(e - s, 1e-9)
+            new_mean = (prev_mean * prev_len + mean_delta * curr_len) / (prev_len + curr_len)
+            merged[-1] = (prev_s, e, label, new_mean)
+        else:
+            merged.append((s, e, label, mean_delta))
+
+    return merged
+
+
+def analyze_brake_levels_in_mutual_plateaus(
+    ref_states: list,
+    slow_states: list,
+    events: list[PlateauBoundaryEvent],
+    *,
+    brake_tolerance: float = 0.08,
+    min_region_m: float = 5.0,
+    merge_gap_m: float = 3.0,
+) -> list[BrakeLevelIssue]:
+    """
+    Analyze brake level inside regions where BOTH laps are applying brake.
+
+    Procedure
+    ---------
+    1. Build one sorted boundary-event list from both laps.
+    2. Sweep adjacent event pairs.
+    3. Whenever the open interval between two adjacent events has both ref and slow
+       brake active, that interval is a mutual-brake region.
+    4. Inside that region, compare slow brake against ref brake on a common arc grid
+       (union of ref and slow sample arcs, with interpolation).
+    5. Split the region into contiguous subregions where slow brake is:
+         - too low  (slow - ref < -brake_tolerance)
+         - too high (slow - ref > +brake_tolerance)
+       and ignore matched parts.
+    """
+    if len(events) < 2:
+        return []
+
+    ref_arc = np.array([s.arc for s in ref_states], dtype=float)
+    ref_brake = np.array([s.brake for s in ref_states], dtype=float)
+    slow_arc = np.array([s.arc for s in slow_states], dtype=float)
+    slow_brake = np.array([s.brake for s in slow_states], dtype=float)
+
+    issues: list[BrakeLevelIssue] = []
+
+    ref_active = False
+    slow_active = False
+
+    for i in range(len(events) - 1):
+        e1 = events[i]
+        e2 = events[i + 1]
+
+        # Apply e1 so the flags describe the interval (e1.arc, e2.arc)
+        if e1.source == "ref":
+            ref_active = (e1.kind == "start")
+        else:
+            slow_active = (e1.kind == "start")
+
+        region_start = float(e1.arc)
+        region_end = float(e2.arc)
+
+        if region_end <= region_start:
             continue
 
-        en_off  = slow.entry_arc - ref.entry_arc
-        pk_off  = slow.peak_arc  - ref.peak_arc
-        rel_off = slow.exit_arc  - ref.exit_arc
-        pk_d    = slow.peak_norm - ref.peak_norm
+        # Only analyze regions where both are on brake
+        if not (ref_active and slow_active):
+            continue
 
-        # Classify entry
-        if abs(en_off) <= on_time_window_m:
-            en_v = EntryVerdict.ON_TIME
-        elif en_off > 0:
-            en_v = EntryVerdict.TOO_LATE
-        else:
-            en_v = EntryVerdict.TOO_EARLY
+        # Build common comparison grid inside this mutual-brake interval
+        ref_mask = (ref_arc >= region_start) & (ref_arc <= region_end)
+        slow_mask = (slow_arc >= region_start) & (slow_arc <= region_end)
 
-        # Classify peak
-        if abs(pk_d) <= peak_norm_tol:
-            pk_v = PeakVerdict.SIMILAR
-        elif pk_d > 0:
-            pk_v = PeakVerdict.TOO_HARD
-        else:
-            pk_v = PeakVerdict.TOO_LIGHT
+        grid = np.concatenate([
+            np.array([region_start, region_end], dtype=float),
+            ref_arc[ref_mask],
+            slow_arc[slow_mask],
+        ])
+        grid = np.unique(np.sort(grid))
 
-        # Classify release
-        if abs(rel_off) <= on_time_window_m:
-            rel_v = ReleaseVerdict.ON_TIME
-        elif rel_off < 0:
-            rel_v = ReleaseVerdict.TOO_EARLY
-        else:
-            rel_v = ReleaseVerdict.TOO_LATE
+        # Need at least one segment
+        if len(grid) < 2:
+            continue
 
-        recs: list[str] = []
-        z = f"~{ref.peak_arc:.0f} m"
+        # Compare on interval midpoints rather than just nodes
+        mids = 0.5 * (grid[:-1] + grid[1:])
+        ref_mid = np.interp(mids, ref_arc, ref_brake)
+        slow_mid = np.interp(mids, slow_arc, slow_brake)
+        delta_mid = slow_mid - ref_mid
 
-        if en_v == EntryVerdict.TOO_LATE:
-            recs.append(
-                f"[{z}] Brake {abs(en_off):.0f} m earlier — "
-                f"you hit the brakes at {slow.entry_arc:.0f} m, "
-                f"reference brakes at {ref.entry_arc:.0f} m. "
-                f"Late braking costs you corner entry speed."
-            )
-        elif en_v == EntryVerdict.TOO_EARLY:
-            recs.append(
-                f"[{z}] You can brake {abs(en_off):.0f} m later — "
-                f"you braked at {slow.entry_arc:.0f} m vs reference {ref.entry_arc:.0f} m. "
-                f"Braking earlier than needed scrubs speed unnecessarily."
-            )
+        # Label each small segment
+        segment_labels: list[str] = []
+        for d in delta_mid:
+            if d < -brake_tolerance:
+                segment_labels.append("low")
+            elif d > brake_tolerance:
+                segment_labels.append("high")
+            else:
+                segment_labels.append("matched")
 
-        if pk_v == PeakVerdict.TOO_HARD:
-            recs.append(
-                f"[{z}] You're braking harder than the reference "
-                f"({slow.peak_norm:.0%} vs {ref.peak_norm:.0%} normalised). "
-                f"This often follows a late entry — the extra pressure compensates "
-                f"for running out of braking distance."
-            )
-        elif pk_v == PeakVerdict.TOO_LIGHT:
-            recs.append(
-                f"[{z}] Your peak brake pressure ({slow.peak_norm:.0%}) is lower than "
-                f"the reference ({ref.peak_norm:.0%}). "
-                f"Commit to initial braking harder — trail off as you turn in."
-            )
+        # Convert contiguous low/high segments into regions
+        raw_regions: list[tuple[float, float, str, float]] = []
+        curr_label = None
+        curr_start = None
+        curr_deltas: list[float] = []
 
-        if rel_v == ReleaseVerdict.TOO_EARLY:
-            recs.append(
-                f"[{z}] You release brakes {abs(rel_off):.0f} m before the reference. "
-                f"Releasing too early loses the rotation trail-braking provides — "
-                f"hold a little pressure as you turn in."
-            )
-        elif rel_v == ReleaseVerdict.TOO_LATE:
-            recs.append(
-                f"[{z}] You hold brakes {abs(rel_off):.0f} m past the reference exit. "
-                f"Braking too deep into the corner tightens the radius and "
-                f"delays throttle application on exit."
-            )
+        for j, label in enumerate(segment_labels):
+            seg_start = float(grid[j])
+            seg_end = float(grid[j + 1])
 
-        if not recs:
-            recs.append(
-                f"[{z}] Braking zone matches the reference well "
-                f"(entry Δ{en_off:+.0f} m, peak Δ{pk_d:+.0%}, release Δ{rel_off:+.0f} m)."
-            )
+            if label == "matched":
+                if curr_label is not None:
+                    raw_regions.append((
+                        curr_start,
+                        seg_start,
+                        curr_label,
+                        float(np.mean(curr_deltas)),
+                    ))
+                    curr_label = None
+                    curr_start = None
+                    curr_deltas = []
+                continue
 
-        results.append(BrakeMatch(
-            ref=ref, slow=slow,
-            entry_verdict=en_v,
-            peak_verdict=pk_v,
-            release_verdict=rel_v,
-            entry_offset_m=en_off,
-            peak_offset_m=pk_off,
-            release_offset_m=rel_off,
-            peak_norm_delta=pk_d,
-            recommendations=recs,
-        ))
+            if curr_label is None:
+                curr_label = label
+                curr_start = seg_start
+                curr_deltas = [float(delta_mid[j])]
+            elif curr_label == label:
+                curr_deltas.append(float(delta_mid[j]))
+            else:
+                raw_regions.append((
+                    curr_start,
+                    seg_start,
+                    curr_label,
+                    float(np.mean(curr_deltas)),
+                ))
+                curr_label = label
+                curr_start = seg_start
+                curr_deltas = [float(delta_mid[j])]
 
-    return results
+        if curr_label is not None:
+            raw_regions.append((
+                curr_start,
+                float(grid[-1]),
+                curr_label,
+                float(np.mean(curr_deltas)),
+            ))
+
+        # Merge nearby same-sign regions across tiny matched gaps
+        merged_regions = _merge_level_regions(raw_regions, merge_gap_m=merge_gap_m)
+
+        # Filter by size and create recommendations
+        for s, e, label, mean_delta in merged_regions:
+            duration = e - s
+            if duration < min_region_m:
+                continue
+
+            if label == "low":
+                issues.append(BrakeLevelIssue(
+                    verdict=PlateauVerdict.LEVEL_TOO_LOW,
+                    arc_start=s,
+                    arc_end=e,
+                    mean_delta=mean_delta,
+                    recommendation=(
+                        f"Between {s:.0f}–{e:.0f} m you should apply more brake "
+                        f"(your brake is lower than the reference by about "
+                        f"{abs(mean_delta):.0%} on average)."
+                    ),
+                ))
+            elif label == "high":
+                issues.append(BrakeLevelIssue(
+                    verdict=PlateauVerdict.LEVEL_TOO_HIGH,
+                    arc_start=s,
+                    arc_end=e,
+                    mean_delta=mean_delta,
+                    recommendation=(
+                        f"Between {s:.0f}–{e:.0f} m you should apply less brake "
+                        f"(your brake is higher than the reference by about "
+                        f"{abs(mean_delta):.0%} on average)."
+                    ),
+                ))
+
+    return issues
+
 
 
 # ---------------------------------------------------------------------------
-# Console report
+# Printing
 # ---------------------------------------------------------------------------
 
-_ICONS = {
-    EntryVerdict.ON_TIME:       "✅",
-    EntryVerdict.TOO_LATE:      "⚠️ ",
-    EntryVerdict.TOO_EARLY:     "⚠️ ",
-    PeakVerdict.SIMILAR:        "✅",
-    PeakVerdict.TOO_HARD:       "⚠️ ",
-    PeakVerdict.TOO_LIGHT:      "⚠️ ",
-    ReleaseVerdict.ON_TIME:     "✅",
-    ReleaseVerdict.TOO_EARLY:   "⚠️ ",
-    ReleaseVerdict.TOO_LATE:    "⚠️ ",
-}
 
-
-def print_brake_recommendations(matches: list[BrakeMatch]) -> None:
+def print_brake_recommendations(boundary_issues: list[BrakeBoundaryIssue], level_issues: list[BrakeLevelIssue]) -> None:
     print("\n" + "=" * 64)
-    print(f"  BRAKES — {len(matches)} reference braking zones analysed")
+    print("  GAS — Boundary Analysis")
     print("=" * 64)
-    for m in matches:
-        ei = _ICONS.get(m.entry_verdict,   "?")
-        pi = _ICONS.get(m.peak_verdict,    "?")
-        ri = _ICONS.get(m.release_verdict, "?")
-        print(f"\n  Zone ~{m.ref.peak_arc:.0f} m  |  "
-              f"entry {ei}  peak {pi}  release {ri}")
-        for rec in m.recommendations:
-            print(f"    • {rec}")
+    for issue in boundary_issues:
+        icon = _ISSUE_ICONS.get(issue.verdict, "?")
+        print(f"  {icon}  {issue.recommendation}")
+
+    print("\n" + "=" * 64)
+    print("  GAS — Brake Level Inside Mutual Plateaus")
+    print("=" * 64)
+    for issue in level_issues:
+        icon = "⚠️ " if issue.verdict in {PlateauVerdict.LEVEL_TOO_LOW, PlateauVerdict.LEVEL_TOO_HIGH} else "✅"
+        print(f"  {icon}  {issue.recommendation}")
 
 
-# ---------------------------------------------------------------------------
-# Colours
-# ---------------------------------------------------------------------------
-
-_EN_COL = {
-    EntryVerdict.ON_TIME:   "#2ecc71",
-    EntryVerdict.TOO_LATE:  "#e74c3c",
-    EntryVerdict.TOO_EARLY: "#f1c40f",
-}
-_PK_COL = {
-    PeakVerdict.SIMILAR:   "#2ecc71",
-    PeakVerdict.TOO_HARD:  "#e74c3c",
-    PeakVerdict.TOO_LIGHT: "#f1c40f",
-}
-_REL_COL = {
-    ReleaseVerdict.ON_TIME:   "#2ecc71",
-    ReleaseVerdict.TOO_EARLY: "#f1c40f",
-    ReleaseVerdict.TOO_LATE:  "#e74c3c",
-}
-
-
-# ---------------------------------------------------------------------------
-# Plotting  (three separate subplots: brake / speed / steering)
-# ---------------------------------------------------------------------------
 
 def plot_brake_analysis(
-    ref_states:  list,
+    ref_states: list,
     slow_states: list,
-    ref_arc:     np.ndarray,
-    slow_arc:    np.ndarray,
-    matches:     list[BrakeMatch],
-    ref_events:  list[BrakeEvent],
-    slow_events: list[BrakeEvent],
-    save_path:   str | None = None,
+    ref_plateaus: list[BrakePlateau],
+    slow_plateaus: list[BrakePlateau],
+    boundary_issues: list[BrakeBoundaryIssue],
+    level_issues: list[BrakeLevelIssue],
+    save_path: str | None = None,
 ) -> None:
     """
-    Three separate subplots stacked vertically:
-      1. Brake pressure (normalised) — event markers + phase lines
-      2. Speed (m/s)                 — context for how braking affects speed
-      3. Steering angle (rad)        — shows trail-braking / mid-corner inputs
+    Two-panel brake plot using aligned CarState.arc.
+
+    Top panel:
+      - raw brake traces
+      - reference / slow plateau spans
+      - timing arrows for early/late/matched start/end boundaries
+
+    Bottom panel:
+      - structural mismatch regions (missing / extra / split / merged)
+      - level mismatch regions inside mutual plateaus
     """
-    # Normalise brake signals for display (scale-independent)
-    ref_brake_raw  = _get_channel(ref_states,  "brake")
-    slow_brake_raw = _get_channel(slow_states, "brake")
-    ref_brake_norm,  _ = _normalise(_smooth(ref_brake_raw))
-    slow_brake_norm, _ = _normalise(_smooth(slow_brake_raw))
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
 
-    ref_speed  = _get_channel(ref_states,  "speed")
-    slow_speed = _get_channel(slow_states, "speed")
-    ref_steer  = _get_channel(ref_states,  "steering")
-    slow_steer = _get_channel(slow_states, "steering")
+    ref_arc = np.array([s.arc for s in ref_states], dtype=float)
+    slow_arc = np.array([s.arc for s in slow_states], dtype=float)
 
-    # Sort slow-lap data by mapped x-coordinate to prevent vertical spikes
-    slow_order = np.argsort(slow_arc, kind="stable")
-    slow_arc_sorted = slow_arc[slow_order]
-    slow_brake_norm_sorted = slow_brake_norm[slow_order]
-    slow_speed_sorted = slow_speed[slow_order]
-    slow_steer_sorted = slow_steer[slow_order]
+    ref_brake = np.array([s.brake for s in ref_states], dtype=float)
+    slow_brake = np.array([s.brake for s in slow_states], dtype=float)
 
-    fig, (ax_brake, ax_speed, ax_steer) = plt.subplots(
-        3, 1, figsize=(18, 12), sharex=False
-    )
-    fig.suptitle(
-        "Brake Analysis — Reference (blue) vs Slow Lap (orange)",
-        fontsize=13, fontweight="bold",
-    )
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 9), sharex=False)
+    fig.suptitle("Brake / Brake Analysis", fontsize=13, fontweight="bold")
 
-    # ── 1. Brake pressure ────────────────────────────────────────────────────
-    ax_brake.plot(ref_arc,  ref_brake_norm,  color="#2980b9", lw=1.4,
-                  label="Reference", zorder=3)
-    ax_brake.plot(slow_arc_sorted, slow_brake_norm_sorted, color="#e67e22", lw=1.4,
-                  alpha=0.9, label="Slow lap", zorder=3)
-    ax_brake.set_title("Brake pressure (normalised 0–1)", fontsize=10, loc="left")
-    ax_brake.set_ylabel("Brake (norm.)")
-    ax_brake.set_xlabel("Arc-length (m)")
-    ax_brake.set_ylim(-0.05, 1.25)
-    ax_brake.grid(True, alpha=0.3)
+    # ------------------------------------------------------------------
+    # Common trace plotting
+    # ------------------------------------------------------------------
+    for ax in (ax1, ax2):
+        ax.plot(ref_arc, ref_brake, color="#2980b9", lw=1.5, label="Reference (fast)", zorder=3)
+        ax.plot(slow_arc, slow_brake, color="#e67e22", lw=1.4, alpha=0.9, label="Slow lap", zorder=3)
+        ax.set_ylabel("Brake (0–1)", fontsize=9)
+        ax.set_xlabel("Arc-length (m)", fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(-0.08, 1.20)
 
-    # Map ref spike index → match for colour lookup
-    ref_idx_to_match = {m.ref.peak_idx: m for m in matches}
+    # ------------------------------------------------------------------
+    # Top panel: plateaus + timing offsets
+    # ------------------------------------------------------------------
+    ax1.set_title("Brake Plateaus and Boundary Timing", fontsize=10, loc="left")
 
-    for ev in ref_events:
-        m     = ref_idx_to_match.get(ev.peak_idx)
-        en_c  = _EN_COL[m.entry_verdict]   if m else "#aaa"
-        pk_c  = _PK_COL[m.peak_verdict]    if m else "#aaa"
-        rel_c = _REL_COL[m.release_verdict] if m else "#aaa"
+    # Background plateau spans
+    for p in ref_plateaus:
+        ax1.axvspan(p.start_arc, p.end_arc, alpha=0.14, color="#2980b9", zorder=1)
+        ax1.plot(p.start_arc, 1.04, "v", color="#2980b9", ms=7, zorder=5)
+        ax1.plot(p.end_arc, 1.04, "s", color="#2980b9", ms=5, zorder=5)
 
-        # Shaded braking zone (reference)
-        ax_brake.axvspan(ev.entry_arc, ev.exit_arc,
-                         alpha=0.10, color="#2980b9", zorder=1)
+    for p in slow_plateaus:
+        ax1.axvspan(p.start_arc, p.end_arc, alpha=0.14, color="#e67e22", zorder=1)
+        ax1.plot(p.start_arc, 0.98, "^", color="#e67e22", ms=7, zorder=5)
+        ax1.plot(p.end_arc, 0.98, "o", color="#e67e22", ms=5, zorder=5)
 
-        # Phase markers: entry (dashed), peak (solid ▼), exit (dotted)
-        ax_brake.axvline(ev.entry_arc, color=en_c,  lw=1.3, ls="--", alpha=0.9, zorder=4)
-        ax_brake.axvline(ev.peak_arc,  color=pk_c,  lw=1.8, ls="-",  alpha=0.9, zorder=4)
-        ax_brake.axvline(ev.exit_arc,  color=rel_c, lw=1.3, ls=":",  alpha=0.9, zorder=4)
+    # Timing issue styling
+    timing_colors = {
+        PlateauVerdict.MATCHED: "#2ecc71",
+        PlateauVerdict.START_TOO_LATE: "#e74c3c",
+        PlateauVerdict.START_TOO_EARLY: "#f1c40f",
+        PlateauVerdict.END_TOO_LATE: "#c0392b",
+        PlateauVerdict.END_TOO_EARLY: "#f39c12",
+    }
 
-        # Peak marker ▼ on the trace
-        ax_brake.plot(ev.peak_arc, ev.peak_norm, "v",
-                      color=pk_c, ms=9, zorder=6)
+    timing_verdicts = {
+        PlateauVerdict.MATCHED,
+        PlateauVerdict.START_TOO_LATE,
+        PlateauVerdict.START_TOO_EARLY,
+        PlateauVerdict.END_TOO_LATE,
+        PlateauVerdict.END_TOO_EARLY,
+    }
 
-        # Offset arrow to slow lap peak (if matched)
-        if m and m.slow is not None and abs(m.peak_offset_m) > 3:
-            y_arrow = 1.10
-            ax_brake.annotate(
+    for issue in boundary_issues:
+        if issue.verdict not in timing_verdicts:
+            continue
+
+        color = timing_colors[issue.verdict]
+
+        # Start timing issues
+        if issue.verdict in {
+            PlateauVerdict.MATCHED,
+            PlateauVerdict.START_TOO_LATE,
+            PlateauVerdict.START_TOO_EARLY,
+        }:
+            if issue.ref is None or issue.slow is None:
+                continue
+
+            y = 1.11
+            ref_x = issue.ref.start_arc
+            slow_x = issue.slow.start_arc
+
+            ax1.plot(ref_x, y, "v", color="#2980b9", ms=8, zorder=7)
+            ax1.plot(slow_x, y, "^", color="#e67e22", ms=8, zorder=7)
+
+            ax1.annotate(
                 "",
-                xy=(m.slow.peak_arc, y_arrow),
-                xytext=(ev.peak_arc,  y_arrow),
-                arrowprops=dict(arrowstyle="->", color=pk_c, lw=1.5),
-                zorder=7,
+                xy=(slow_x, y),
+                xytext=(ref_x, y),
+                arrowprops=dict(arrowstyle="->", color=color, lw=1.5),
+                zorder=6,
             )
-            mid = (ev.peak_arc + m.slow.peak_arc) / 2
-            ax_brake.text(mid, 1.14, f"{m.peak_offset_m:+.0f} m",
-                          ha="center", fontsize=7, color=pk_c, zorder=8)
 
-    # Slow-lap event peaks ▲
-    for ev in slow_events:
-        ax_brake.plot(ev.peak_arc, ev.peak_norm, "^",
-                      color="#e67e22", ms=7, alpha=0.85, zorder=5)
+            mid = 0.5 * (ref_x + slow_x)
+            label = (
+                f"{issue.offset_m:+.0f} m"
+                if issue.offset_m is not None
+                else "0 m"
+            )
+            ax1.text(mid, y + 0.025, label, ha="center", fontsize=7, color=color, zorder=8)
 
-    legend_els = [
-        mpatches.Patch(color="#2980b9", label="Reference"),
-        mpatches.Patch(color="#e67e22", label="Slow lap"),
-        plt.Line2D([0], [0], color="#555", ls="--", lw=1.3, label="Entry"),
-        plt.Line2D([0], [0], color="#555", ls="-",  lw=1.8, label="Peak"),
-        plt.Line2D([0], [0], color="#555", ls=":",  lw=1.3, label="Release"),
-        mpatches.Patch(color="#2ecc71", alpha=0.5, label="On time / similar"),
-        mpatches.Patch(color="#e74c3c", alpha=0.5, label="Late / too hard"),
-        mpatches.Patch(color="#f1c40f", alpha=0.5, label="Early / too light"),
+        # End timing issues
+        if issue.verdict in {
+            PlateauVerdict.MATCHED,
+            PlateauVerdict.END_TOO_LATE,
+            PlateauVerdict.END_TOO_EARLY,
+        }:
+            if issue.ref is None or issue.slow is None:
+                continue
+
+            y = 1.15
+            ref_x = issue.ref.end_arc
+            slow_x = issue.slow.end_arc
+
+            ax1.plot(ref_x, y, "s", color="#2980b9", ms=6, zorder=7)
+            ax1.plot(slow_x, y, "o", color="#e67e22", ms=6, zorder=7)
+
+            ax1.annotate(
+                "",
+                xy=(slow_x, y),
+                xytext=(ref_x, y),
+                arrowprops=dict(arrowstyle="->", color=color, lw=1.5),
+                zorder=6,
+            )
+
+            mid = 0.5 * (ref_x + slow_x)
+            label = (
+                f"{issue.offset_m:+.0f} m"
+                if issue.offset_m is not None
+                else "0 m"
+            )
+            ax1.text(mid, y + 0.02, label, ha="center", fontsize=7, color=color, zorder=8)
+
+    legend_top = [
+        mpatches.Patch(color="#2980b9", alpha=0.35, label="Reference plateau"),
+        mpatches.Patch(color="#e67e22", alpha=0.35, label="Slow plateau"),
+        plt.Line2D([0], [0], color="#2ecc71", lw=2, label="Boundary matched"),
+        plt.Line2D([0], [0], color="#e74c3c", lw=2, label="Start too late"),
+        plt.Line2D([0], [0], color="#f1c40f", lw=2, label="Start too early"),
+        plt.Line2D([0], [0], color="#c0392b", lw=2, label="End too late"),
+        plt.Line2D([0], [0], color="#f39c12", lw=2, label="End too early"),
     ]
-    ax_brake.legend(handles=legend_els, fontsize=7.5, loc="upper right", ncol=4)
+    ax1.legend(handles=legend_top, fontsize=7.5, loc="upper right", ncol=3)
 
-    # ── 2. Speed ─────────────────────────────────────────────────────────────
-    ax_speed.plot(ref_arc,  ref_speed,  color="#2980b9", lw=1.4, label="Reference")
-    ax_speed.plot(slow_arc_sorted, slow_speed_sorted, color="#e67e22", lw=1.4, alpha=0.9, label="Slow lap")
-    ax_speed.set_title("Speed (m/s)", fontsize=10, loc="left")
-    ax_speed.set_ylabel("Speed (m/s)")
-    ax_speed.set_xlabel("Arc-length (m)")
-    ax_speed.grid(True, alpha=0.3)
+    # ------------------------------------------------------------------
+    # Bottom panel: structural + level issues
+    # ------------------------------------------------------------------
+    ax2.set_title("Structure and Brake-Level Mismatches", fontsize=10, loc="left")
 
-    # Shade braking zones on speed plot too (helps correlate visually)
-    for ev in ref_events:
-        ax_speed.axvspan(ev.entry_arc, ev.exit_arc, alpha=0.08, color="#2980b9", zorder=1)
+    # Show plateau spans faintly again for context
+    for p in ref_plateaus:
+        ax2.axvspan(p.start_arc, p.end_arc, alpha=0.06, color="#2980b9", zorder=1)
+    for p in slow_plateaus:
+        ax2.axvspan(p.start_arc, p.end_arc, alpha=0.06, color="#e67e22", zorder=1)
 
-    ax_speed.legend(fontsize=8, loc="upper right")
+    structure_colors = {
+        PlateauVerdict.MISSING: "#7f8c8d",
+        PlateauVerdict.EXTRA: "#34495e",
+        PlateauVerdict.SPLIT: "#8e44ad",
+        PlateauVerdict.MERGED: "#1abc9c",
+    }
 
-    # ── 3. Steering ──────────────────────────────────────────────────────────
-    ax_steer.plot(ref_arc,  ref_steer,  color="#2980b9", lw=1.4, label="Reference")
-    ax_steer.plot(slow_arc_sorted, slow_steer_sorted, color="#e67e22", lw=1.4, alpha=0.9, label="Slow lap")
-    ax_steer.axhline(0, color="#bbb", lw=0.7)
-    ax_steer.set_title("Steering angle (rad)  — shows trail-braking overlap",
-                       fontsize=10, loc="left")
-    ax_steer.set_ylabel("Steering (rad)")
-    ax_steer.set_xlabel("Arc-length (m)")
-    ax_steer.grid(True, alpha=0.3)
+    # Plot structural issues as bold shaded regions
+    for issue in boundary_issues:
+        if issue.verdict not in structure_colors:
+            continue
 
-    # Shade braking zones so you can see when the driver is steering while braking
-    for ev in ref_events:
-        ax_steer.axvspan(ev.entry_arc, ev.exit_arc, alpha=0.08, color="#2980b9", zorder=1)
+        color = structure_colors[issue.verdict]
+        ax2.axvspan(issue.arc_start, issue.arc_end, alpha=0.28, color=color, zorder=2)
 
-    ax_steer.legend(fontsize=8, loc="upper right")
+        mid = 0.5 * (issue.arc_start + issue.arc_end)
+        label_map = {
+            PlateauVerdict.MISSING: "missing",
+            PlateauVerdict.EXTRA: "extra",
+            PlateauVerdict.SPLIT: "split",
+            PlateauVerdict.MERGED: "merged",
+        }
+        ax2.text(
+            mid,
+            1.08,
+            label_map[issue.verdict],
+            ha="center",
+            va="center",
+            fontsize=7,
+            color=color,
+            zorder=5,
+        )
+
+    # Plot level issues as colored subregions inside mutual plateaus
+    level_colors = {
+        PlateauVerdict.LEVEL_TOO_LOW: "#9b59b6",
+        PlateauVerdict.LEVEL_TOO_HIGH: "#16a085",
+    }
+
+    for issue in level_issues:
+        if issue.verdict not in level_colors:
+            continue
+
+        color = level_colors[issue.verdict]
+        ax2.axvspan(issue.arc_start, issue.arc_end, ymin=0.05, ymax=0.92, alpha=0.22, color=color, zorder=3)
+
+        mid = 0.5 * (issue.arc_start + issue.arc_end)
+        short = "more brake" if issue.verdict == PlateauVerdict.LEVEL_TOO_LOW else "less brake"
+        ax2.text(
+            mid,
+            0.10,
+            short,
+            ha="center",
+            va="bottom",
+            fontsize=7,
+            color=color,
+            rotation=0,
+            zorder=6,
+        )
+
+    legend_bottom = [
+        mpatches.Patch(color=structure_colors[PlateauVerdict.MISSING], alpha=0.5, label="Missing plateau"),
+        mpatches.Patch(color=structure_colors[PlateauVerdict.EXTRA], alpha=0.5, label="Extra plateau"),
+        mpatches.Patch(color=structure_colors[PlateauVerdict.SPLIT], alpha=0.5, label="Split plateau"),
+        mpatches.Patch(color=structure_colors[PlateauVerdict.MERGED], alpha=0.5, label="Merged plateau"),
+        mpatches.Patch(color=level_colors[PlateauVerdict.LEVEL_TOO_LOW], alpha=0.4, label="Apply more brake"),
+        mpatches.Patch(color=level_colors[PlateauVerdict.LEVEL_TOO_HIGH], alpha=0.4, label="Apply less brake"),
+    ]
+    ax2.legend(handles=legend_bottom, fontsize=7.5, loc="upper right", ncol=3)
 
     plt.tight_layout()
-
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"Brake analysis plot saved → {save_path}")
@@ -568,37 +948,72 @@ def plot_brake_analysis(
         plt.show()
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+
 
 if __name__ == "__main__":
     import sys
+    from parser import LapDataParser, align_laps, filter_arc_jumps
 
     print("Loading reference (fast) lap …")
-    ref_states  = LapDataParser("data/hackathon/hackathon_fast_laps.mcap").get_lap_data()
+    ref_states = LapDataParser("data/hackathon/hackathon_fast_laps.mcap").get_lap_data()
 
     print("Loading slow lap …")
     slow_states = LapDataParser("data/hackathon/hackathon_good_lap.mcap").get_lap_data()
 
-    # slow_arc is expressed in reference metres — no independent arc calculation
-    ref_arc, slow_arc, _ = align_laps(ref_states, slow_states)
+    ref_states, slow_states = align_laps(ref_states, slow_states)
 
-    print("Detecting brake events …")
-    ref_events  = detect_brake_events(ref_states,  ref_arc)
-    slow_events = detect_brake_events(slow_states, slow_arc)
-    print(f"  Reference brake zones : {len(ref_events)}")
-    print(f"  Slow lap brake zones  : {len(slow_events)}")
+    ref_count = len(ref_states)
+    slow_count = len(slow_states)
 
-    print("Matching …")
-    matches = match_brake_events(ref_events, slow_events)
+    ref_states = filter_arc_jumps(ref_states)
+    slow_states = filter_arc_jumps(slow_states)
 
-    print_brake_recommendations(matches)
+    print(f"{ref_count - len(ref_states)} ref points discarded")
+    print(f"{slow_count - len(slow_states)} slot points discarded")
+
+    max_br = 0
+    for st in ref_states:
+        max_br = max(max_br, st.brake)
+    print(f"max brake in ref: {max_br}")
+    max_br = 0
+    for st in slow_states:
+        max_br = max(max_br, st.brake)
+    print(f"max brake in slow: {max_br}")
+
+    ref_plateaus = detect_brake_plateaus(ref_states)
+    slow_plateaus = detect_brake_plateaus(slow_states)
+
+    print("Ref plateaus:")
+    for pl in ref_plateaus:
+        print(f"{pl.start_arc} - {pl.end_arc}: {pl.mean_brake}")
+
+    print("Slow plateaus:")
+    for pl in slow_plateaus:
+        print(f"{pl.start_arc} - {pl.end_arc}: {pl.mean_brake}")
+
+    events = _build_boundary_events(ref_plateaus, slow_plateaus)
+
+    boundary_issues = analyze_brake_boundaries(
+        ref_plateaus,
+        slow_plateaus,
+        events,
+    )
+
+    level_issues = analyze_brake_levels_in_mutual_plateaus(
+        ref_states,
+        slow_states,
+        events,
+    )
+
+    print_brake_recommendations(boundary_issues, level_issues)
 
     save = sys.argv[1] if len(sys.argv) > 1 else None
+
     plot_brake_analysis(
-        ref_states, slow_states,
-        ref_arc, slow_arc,
-        matches, ref_events, slow_events,
-        save_path=save,
+        ref_states,
+        slow_states,
+        ref_plateaus,
+        slow_plateaus,
+        boundary_issues,
+        level_issues,
     )

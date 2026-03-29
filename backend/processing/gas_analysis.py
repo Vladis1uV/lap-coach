@@ -1,39 +1,56 @@
 """
 gas_analysis.py
 ===============
-Throttle-specific event detection for lap comparison.
+Threshold-based throttle plateau analysis for lap comparison.
 
-Throttle (gas) is a *sustained* signal, not a spike.  The meaningful events are:
+New logic
+---------
+We use a single global threshold for "gas is applied".
 
-  - **ThrottleApplication**: the moment the driver commits to throttle after a
-    corner — detected as a rising edge where gas crosses a low threshold going
-    upward.  Directly comparable across laps: "you opened the throttle 18 m late."
+A throttle plateau is defined as a contiguous region where:
+    gas >= applied_threshold
 
-  - **ThrottlePlateau**: a sustained high-throttle region (driver fully committed).
-    Comparable by start position, duration, and mean level:
-    "you lifted 30 m before the reference" / "you never fully committed here."
+Events are derived from plateau boundaries:
+  - plateau start: gas crosses threshold upward
+  - plateau end:   gas crosses threshold downward
 
-Both are expressed in arc-length (metres) so they are speed-independent.
+Comparison categories
+---------------------
+1. Timing misalignment
+   Both laps contain the same plateau region in essence, but one starts and/or
+   ends earlier/later than the reference.
+
+2. Structural mismatch
+   One lap contains a plateau where the other does not:
+   - extra plateau in slow lap
+   - missing plateau in slow lap
+   - slow lap stops applying gas while reference still pushes
+   - slow lap applies gas while reference does not
+
+3. Level mismatch
+   Both laps contain the plateau, but the gas level inside it differs
+   materially (mean / peak level too low or too high).
 
 Public API
 ----------
-    detect_throttle_applications(states, arc, **kwargs) -> list[ThrottleApplication]
-    detect_throttle_plateaus(states, arc, **kwargs)     -> list[ThrottlePlateau]
-    match_throttle_applications(ref, slow, ...)         -> list[ThrottleAppMatch]
-    match_throttle_plateaus(ref, slow, ...)             -> list[ThrottlePlateauMatch]
-    print_gas_recommendations(app_matches, plat_matches)
+    detect_throttle_plateaus(states, arc, **kwargs) -> list[ThrottlePlateau]
+    match_throttle_plateaus(ref, slow, **kwargs)    -> list[ThrottlePlateauMatch]
+    find_extra_slow_plateaus(ref, slow, **kwargs)   -> list[ThrottlePlateau]
+    print_gas_recommendations(matches, extra_slow)
+    plot_gas_analysis(...)
 
-Dependencies: numpy, scipy
+Dependencies: numpy, scipy, matplotlib
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from enum import Enum, auto
 
 import numpy as np
 from scipy.ndimage import uniform_filter1d
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +58,7 @@ from scipy.ndimage import uniform_filter1d
 # ---------------------------------------------------------------------------
 
 def _smooth(signal: np.ndarray, window: int = 5) -> np.ndarray:
-    """Uniform (box) smoothing to remove sensor noise before differentiation."""
+    """Uniform smoothing to reduce sensor noise before thresholding."""
     return uniform_filter1d(signal.astype(float), size=max(1, window))
 
 
@@ -54,601 +71,874 @@ def _arc_to_sample_distance(arc: np.ndarray, metres: float) -> int:
 
 
 # ---------------------------------------------------------------------------
-# ThrottleApplication — rising-edge events
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ThrottleApplication:
-    """
-    The moment a driver commits to throttle after a corner.
-
-    Detected as a rising edge: gas crosses `low_threshold` going upward,
-    and subsequently reaches `high_threshold` within `confirm_window_m` metres
-    (confirming it's a genuine application, not a flutter).
-    """
-    index: int          # sample index of the rising edge
-    arc_pos: float      # arc-length at rising edge (m)
-    peak_value: float   # maximum gas reached in the following confirm window
-    peak_arc: float     # arc-length of that peak
-    x: float
-    y: float
-
-
-def detect_throttle_applications(
-    states: list,           # list[CarState]
-    arc: np.ndarray,
-    *,
-    low_threshold: float    = 0.10,   # gas level that defines "off throttle"
-    high_threshold: float   = 0.55,   # gas level that must be reached to confirm
-    confirm_window_m: float = 40.0,   # metres within which high_threshold must be hit
-    min_sustain_m: float    = 8.0,    # gas must stay above low_threshold for this many
-                                      # metres after the edge — filters gear-change blips
-    min_gap_m: float        = 30.0,   # minimum metres between two raw candidates
-    cluster_window_m: float = 80.0,   # post-detection: merge candidates within this
-                                      # window, keeping only the highest-peak one
-    smooth_window: int      = 7,      # samples for pre-smoothing
-) -> list[ThrottleApplication]:
-    """
-    Detect throttle-application events (rising edges) in *states*.
-
-    Two-stage filtering keeps the marker count clean:
-
-    Stage 1 — per-edge validation (at detection time)
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    A rising edge is a candidate only if:
-      a) gas crosses low_threshold going upward, AND
-      b) gas stays above low_threshold for at least min_sustain_m metres
-         (rejects gear-change blips that immediately drop back), AND
-      c) gas reaches high_threshold within confirm_window_m metres
-         (confirms it's a real commit, not a partial squeeze), AND
-      d) it is at least min_gap_m from the previous accepted candidate.
-
-    Stage 2 — cluster merging (post-detection)
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    Any remaining candidates within cluster_window_m metres of each other
-    are collapsed into a single representative event — the one with the
-    highest peak_value.  This handles chicane sequences and complex
-    acceleration zones where a driver applies throttle, briefly lifts for
-    a kink, then reapplies: only the dominant application survives.
-    """
-    gas = _smooth(np.array([s.gas for s in states]), smooth_window)
-    n = len(gas)
-    candidates: list[ThrottleApplication] = []
-    last_event_arc = -min_gap_m - 1.0
-
-    confirm_samples = _arc_to_sample_distance(arc, confirm_window_m)
-    sustain_samples = _arc_to_sample_distance(arc, min_sustain_m)
-
-    for i in range(1, n):
-        # Rising edge: was below threshold, now at or above it
-        if gas[i - 1] < low_threshold <= gas[i]:
-            if arc[i] - last_event_arc < min_gap_m:
-                continue
-
-            # Stage 1a — sustain check: must stay above low_threshold
-            sustain_end = min(i + sustain_samples, n)
-            if np.any(gas[i:sustain_end] < low_threshold):
-                continue   # drops back too quickly → blip, skip it
-
-            # Stage 1b — confirm check: must reach high_threshold
-            confirm_end = min(i + confirm_samples, n)
-            window_gas  = gas[i:confirm_end]
-            if window_gas.max() < high_threshold:
-                continue
-
-            peak_local = int(np.argmax(window_gas))
-            peak_idx   = i + peak_local
-
-            candidates.append(ThrottleApplication(
-                index=i,
-                arc_pos=float(arc[i]),
-                peak_value=float(window_gas[peak_local]),
-                peak_arc=float(arc[peak_idx]),
-                x=states[i].x,
-                y=states[i].y,
-            ))
-            last_event_arc = float(arc[i])
-
-    # Stage 2 — cluster merging
-    return _cluster_applications(candidates, cluster_window_m)
-
-
-def _cluster_applications(
-    candidates: list[ThrottleApplication],
-    cluster_window_m: float,
-) -> list[ThrottleApplication]:
-    """
-    Collapse candidates within cluster_window_m metres into one representative.
-
-    Groups are formed greedily: a new group starts whenever the gap between
-    consecutive candidates (sorted by arc_pos) exceeds cluster_window_m.
-    The surviving event from each group is whichever has the highest peak_value
-    — i.e. the most committed throttle application in that zone.
-    """
-    if not candidates:
-        return []
-
-    # Sort by position (should already be sorted, but be safe)
-    sorted_cands = sorted(candidates, key=lambda e: e.arc_pos)
-
-    groups: list[list[ThrottleApplication]] = []
-    current_group = [sorted_cands[0]]
-
-    for prev, curr in zip(sorted_cands, sorted_cands[1:]):
-        if curr.arc_pos - prev.arc_pos <= cluster_window_m:
-            current_group.append(curr)
-        else:
-            groups.append(current_group)
-            current_group = [curr]
-    groups.append(current_group)
-
-    # Pick the highest-peak candidate from each group
-    return [max(g, key=lambda e: e.peak_value) for g in groups]
-
-
-# ---------------------------------------------------------------------------
-# ThrottlePlateau — sustained high-throttle regions
+# Data model
 # ---------------------------------------------------------------------------
 
 @dataclass
 class ThrottlePlateau:
     """
-    A sustained high-throttle region (driver fully committed).
+    A contiguous region where gas is considered applied.
 
-    Characterised by start, end, duration (metres), and mean gas level.
+    Start is the first sample where gas crosses the threshold upward.
+    End is the last consecutive sample before it falls below threshold.
     """
     start_idx: int
     end_idx: int
-    start_arc: float    # m
-    end_arc: float      # m
-    duration_m: float   # end_arc - start_arc
+    start_arc: float
+    end_arc: float
+    duration_m: float
     mean_gas: float
+    peak_gas: float
     x_start: float
     y_start: float
+    x_end: float
+    y_end: float
 
 
+# ---------------------------------------------------------------------------
+# Detection
+# ---------------------------------------------------------------------------
 def detect_throttle_plateaus(
     states: list,
-    arc: np.ndarray,
     *,
-    plateau_threshold: float = 0.70,  # gas level to count as "full throttle"
-    min_duration_m: float = 20.0,     # minimum length to count as a plateau
-    merge_gap_m: float = 10.0,        # merge two plateaus if gap < this
-    smooth_window: int = 9,
+    applied_threshold: float = 0.10,
+    min_duration_m: float = 0.0,
+    merge_gap_m: float = 10.0,
+    smooth_window: int = 7,
 ) -> list[ThrottlePlateau]:
     """
-    Detect sustained high-throttle plateaus.
+    Detect threshold-based throttle plateaus.
 
-    Algorithm
-    ---------
-    1. Smooth and threshold the gas signal → binary "in plateau" mask.
-    2. Find contiguous True runs in the mask.
-    3. Merge runs separated by less than merge_gap_m (brief lifts in a long
-       straight, e.g. gear changes).
-    4. Keep only runs whose arc-length span ≥ min_duration_m.
+    Plateau = contiguous region where gas >= applied_threshold.
+
+    This version correctly handles edge plateaus:
+    - if gas starts above threshold, a plateau begins at index 0
+    - if gas ends above threshold, the plateau ends at the last index
     """
-    gas = _smooth(np.array([s.gas for s in states]), smooth_window)
-    mask = gas >= plateau_threshold
+    if not states:
+        return []
 
-    # Find contiguous runs
+    gas = _smooth(np.array([s.gas for s in states]), smooth_window)
+    # gas = np.array([s.gas for s in states])
+    mask = gas >= applied_threshold
+    n = len(mask)
+
+    # Find contiguous True runs, including ones that start at 0 or end at n-1
     runs: list[tuple[int, int]] = []
-    in_run = False
-    start = 0
-    for i, val in enumerate(mask):
-        if val and not in_run:
+    start: int | None = 0 if mask[0] else None
+
+    for i in range(1, n):
+        # False -> True : plateau starts at i
+        if not mask[i - 1] and mask[i]:
             start = i
-            in_run = True
-        elif not val and in_run:
-            runs.append((start, i - 1))
-            in_run = False
-    if in_run:
-        runs.append((start, len(mask) - 1))
+        # True -> False : plateau ends at i-1
+        elif mask[i - 1] and not mask[i]:
+            if start is not None:
+                runs.append((start, i - 1))
+                start = None
+
+    # If still inside a plateau at the end, close it at the last sample
+    if start is not None:
+        runs.append((start, n - 1))
 
     if not runs:
         return []
 
-    # Merge close runs
-    merge_gap_samples = _arc_to_sample_distance(arc, merge_gap_m)
+    # Merge runs separated by very short gaps
     merged: list[tuple[int, int]] = [runs[0]]
     for s, e in runs[1:]:
-        if s - merged[-1][1] <= merge_gap_samples:
-            merged[-1] = (merged[-1][0], e)
+        prev_s, prev_e = merged[-1]
+        gap_m = float(states[s].arc - states[prev_e].arc)
+        if gap_m <= merge_gap_m:
+            merged[-1] = (prev_s, e)
         else:
             merged.append((s, e))
 
-    # Filter by minimum duration and build dataclasses
     plateaus: list[ThrottlePlateau] = []
     for s, e in merged:
-        duration = arc[e] - arc[s]
-        if duration >= min_duration_m:
-            plateaus.append(ThrottlePlateau(
-                start_idx=s,
-                end_idx=e,
-                start_arc=float(arc[s]),
-                end_arc=float(arc[e]),
-                duration_m=float(duration),
-                mean_gas=float(gas[s:e + 1].mean()),
-                x_start=states[s].x,
-                y_start=states[s].y,
-            ))
+        duration = float(states[e].arc - states[s].arc)
+        if duration < min_duration_m:
+            continue
+
+        seg = gas[s:e + 1]
+        plateaus.append(ThrottlePlateau(
+            start_idx=s,
+            end_idx=e,
+            start_arc=float(states[s].arc),
+            end_arc=float(states[e].arc),
+            duration_m=duration,
+            mean_gas=float(seg.mean()),
+            peak_gas=float(seg.max()),
+            x_start=states[s].x,
+            y_start=states[s].y,
+            x_end=states[e].x,
+            y_end=states[e].y,
+        ))
 
     return plateaus
 
 
 # ---------------------------------------------------------------------------
-# Matching — ThrottleApplication
-# ---------------------------------------------------------------------------
-
-class AppVerdict(Enum):
-    ON_TIME   = auto()
-    TOO_LATE  = auto()   # slow driver commits to throttle later on track
-    TOO_EARLY = auto()   # slow driver commits earlier (unusual but possible)
-    MISSING   = auto()   # no matching application in search window
-
-
-@dataclass
-class ThrottleAppMatch:
-    ref: ThrottleApplication
-    slow: ThrottleApplication | None
-    verdict: AppVerdict
-    offset_m: float           # slow.arc_pos − ref.arc_pos (+  = later)
-    recommendation: str
-
-
-def _nearest_app(
-    target_arc: float,
-    candidates: list[ThrottleApplication],
-    radius_m: float,
-) -> ThrottleApplication | None:
-    within = [a for a in candidates if abs(a.arc_pos - target_arc) <= radius_m]
-    return min(within, key=lambda a: abs(a.arc_pos - target_arc)) if within else None
-
-
-def match_throttle_applications(
-    ref_apps: list[ThrottleApplication],
-    slow_apps: list[ThrottleApplication],
-    *,
-    on_time_window_m: float = 10.0,
-    search_radius_m: float  = 60.0,
-) -> list[ThrottleAppMatch]:
-    """Match each reference throttle-application to the nearest slow-lap equivalent."""
-    results: list[ThrottleAppMatch] = []
-
-    for ref in ref_apps:
-        slow = _nearest_app(ref.arc_pos, slow_apps, search_radius_m)
-
-        if slow is None:
-            verdict = AppVerdict.MISSING
-            offset  = float("nan")
-            rec = (
-                f"At ~{ref.arc_pos:.0f} m the reference driver applies throttle "
-                f"(peaks at {ref.peak_value:.0%}) — "
-                f"no matching throttle application found within "
-                f"{search_radius_m:.0f} m of this position."
-            )
-        else:
-            offset = slow.arc_pos - ref.arc_pos
-            if abs(offset) <= on_time_window_m:
-                verdict = AppVerdict.ON_TIME
-                rec = (
-                    f"At ~{ref.arc_pos:.0f} m your throttle timing is good "
-                    f"(offset {offset:+.1f} m).  "
-                    f"Reference peak: {ref.peak_value:.0%}, yours: {slow.peak_value:.0%}."
-                )
-            elif offset > 0:
-                # slow driver opens throttle later (further along track)
-                verdict = AppVerdict.TOO_LATE
-                rec = (
-                    f"At ~{ref.arc_pos:.0f} m you should get on the throttle sooner — "
-                    f"you opened it {abs(offset):.1f} m too late "
-                    f"(you: {slow.arc_pos:.0f} m, reference: {ref.arc_pos:.0f} m).  "
-                    f"Getting on gas earlier here will carry more exit speed."
-                )
-            else:
-                verdict = AppVerdict.TOO_EARLY
-                rec = (
-                    f"At ~{ref.arc_pos:.0f} m you applied throttle "
-                    f"{abs(offset):.1f} m earlier than the reference "
-                    f"(you: {slow.arc_pos:.0f} m, reference: {ref.arc_pos:.0f} m).  "
-                    f"This may be causing understeer on corner exit — "
-                    f"wait until you're more settled before committing."
-                )
-
-        results.append(ThrottleAppMatch(
-            ref=ref, slow=slow, verdict=verdict,
-            offset_m=offset, recommendation=rec,
-        ))
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Matching — ThrottlePlateau
+# Matching / comparison of plateaus
 # ---------------------------------------------------------------------------
 
 class PlateauVerdict(Enum):
-    MATCHED      = auto()   # similar start, similar duration
-    LATE_START   = auto()   # slow driver starts plateau later
-    EARLY_LIFT   = auto()   # slow driver ends plateau earlier (shorter)
-    UNDER_COMMIT = auto()   # slow driver never reaches plateau_threshold here
-    MISSING      = auto()   # no overlapping plateau found
+    MATCHED = auto()
+
+    START_TOO_LATE = auto()
+    START_TOO_EARLY = auto()
+    END_TOO_LATE = auto()
+    END_TOO_EARLY = auto()
+
+    LEVEL_TOO_LOW = auto()
+    LEVEL_TOO_HIGH = auto()
+
+    MISSING = auto()
+    EXTRA = auto()
+    SPLIT = auto()
+    MERGED = auto()
 
 
 @dataclass
-class ThrottlePlateauMatch:
-    ref: ThrottlePlateau
-    slow: ThrottlePlateau | None
+class PlateauBoundaryEvent:
+    arc: float
+    source: str            # "ref" | "slow"
+    kind: str              # "start" | "end"
+    plateau: ThrottlePlateau
+
+
+@dataclass
+class ThrottleBoundaryIssue:
     verdict: PlateauVerdict
-    start_offset_m: float     # slow.start_arc − ref.start_arc
-    duration_delta_m: float   # slow.duration_m − ref.duration_m (negative = shorter)
+    ref: ThrottlePlateau | None
+    slow: ThrottlePlateau | None
+    arc_start: float
+    arc_end: float
+    offset_m: float | None
     recommendation: str
 
 
-def _overlapping_plateau(
-    ref: ThrottlePlateau,
-    candidates: list[ThrottlePlateau],
-    search_radius_m: float,
-) -> ThrottlePlateau | None:
-    """Return the candidate plateau whose start is closest to ref.start_arc."""
-    within = [
-        p for p in candidates
-        if abs(p.start_arc - ref.start_arc) <= search_radius_m
-        or (p.start_arc <= ref.end_arc and p.end_arc >= ref.start_arc)
-    ]
-    return min(within, key=lambda p: abs(p.start_arc - ref.start_arc)) if within else None
 
-
-def match_throttle_plateaus(
+def _build_boundary_events(
     ref_plateaus: list[ThrottlePlateau],
     slow_plateaus: list[ThrottlePlateau],
-    *,
-    on_time_window_m: float   = 10.0,
-    search_radius_m: float    = 60.0,
-    duration_threshold_m: float = 15.0,  # delta duration to flag "early lift"
-) -> list[ThrottlePlateauMatch]:
-    results: list[ThrottlePlateauMatch] = []
+) -> list[PlateauBoundaryEvent]:
+    events: list[PlateauBoundaryEvent] = []
 
-    for ref in ref_plateaus:
-        slow = _overlapping_plateau(ref, slow_plateaus, search_radius_m)
-
-        if slow is None:
-            verdict = PlateauVerdict.MISSING
-            s_off = float("nan")
-            d_off = float("nan")
-            rec = (
-                f"Between {ref.start_arc:.0f}–{ref.end_arc:.0f} m the reference "
-                f"holds full throttle ({ref.duration_m:.0f} m, "
-                f"avg {ref.mean_gas:.0%}) — "
-                f"no matching full-throttle region found. "
-                f"You may be lifting where you should be committed."
-            )
-        else:
-            s_off = slow.start_arc - ref.start_arc
-            d_off = slow.duration_m - ref.duration_m
-
-            issues: list[str] = []
-
-            if s_off > on_time_window_m:
-                verdict = PlateauVerdict.LATE_START
-                issues.append(
-                    f"you opened throttle {s_off:.0f} m late "
-                    f"(get on gas at ~{ref.start_arc:.0f} m, not {slow.start_arc:.0f} m)"
-                )
-            elif s_off < -on_time_window_m:
-                # Rare — driver opened throttle early but maybe didn't hold it
-                issues.append(
-                    f"you opened throttle {abs(s_off):.0f} m early — check for understeer"
-                )
-
-            if d_off < -duration_threshold_m:
-                verdict = PlateauVerdict.EARLY_LIFT
-                issues.append(
-                    f"you lifted {abs(d_off):.0f} m before the reference "
-                    f"(held {slow.duration_m:.0f} m vs {ref.duration_m:.0f} m) — "
-                    f"trust the grip and stay on it longer"
-                )
-
-            if slow.mean_gas < ref.mean_gas - 0.10:
-                verdict = PlateauVerdict.UNDER_COMMIT
-                issues.append(
-                    f"your average throttle ({slow.mean_gas:.0%}) is well below "
-                    f"the reference ({ref.mean_gas:.0%}) — commit more fully"
-                )
-
-            if not issues:
-                verdict = PlateauVerdict.MATCHED
-                rec = (
-                    f"Between {ref.start_arc:.0f}–{ref.end_arc:.0f} m "
-                    f"your full-throttle application matches the reference well."
-                )
-            else:
-                rec = (
-                    f"Between {ref.start_arc:.0f}–{ref.end_arc:.0f} m: "
-                    + "; ".join(issues) + "."
-                )
-
-        results.append(ThrottlePlateauMatch(
-            ref=ref, slow=slow, verdict=verdict,
-            start_offset_m=s_off, duration_delta_m=d_off,
-            recommendation=rec,
+    for p in ref_plateaus:
+        events.append(PlateauBoundaryEvent(
+            arc=p.start_arc, source="ref", kind="start", plateau=p
+        ))
+        events.append(PlateauBoundaryEvent(
+            arc=p.end_arc, source="ref", kind="end", plateau=p
         ))
 
-    return results
+    for p in slow_plateaus:
+        events.append(PlateauBoundaryEvent(
+            arc=p.start_arc, source="slow", kind="start", plateau=p
+        ))
+        events.append(PlateauBoundaryEvent(
+            arc=p.end_arc, source="slow", kind="end", plateau=p
+        ))
+
+    # End before start at the same location, to make short lift/reapply behavior cleaner.
+    kind_order = {"end": 0, "start": 1}
+    src_order = {"ref": 0, "slow": 1}
+
+    events.sort(key=lambda e: (e.arc, kind_order[e.kind], src_order[e.source]))
+    return events
+
+
+
+def analyze_throttle_boundaries(
+    ref_plateaus: list[ThrottlePlateau],
+    slow_plateaus: list[ThrottlePlateau],
+    events: list[PlateauBoundaryEvent],
+    *,
+    timing_window_m: float = 12.0,
+    timing_tolerance_m: float = 3.0,
+    min_struct_gap_m: float = 2.0,
+    level_mean_tol: float = 0.10,
+    level_peak_tol: float = 0.12,
+) -> list[ThrottleBoundaryIssue]:
+    """
+    Analyze throttle plateaus by sweeping through a single sorted list of
+    plateau boundary events from both laps.
+
+    Pairwise logic on adjacent events:
+      ref start -> slow start   => MATCHED / START_TOO_LATE
+      slow start -> ref start   => MATCHED / START_TOO_EARLY
+      ref end   -> slow end     => MATCHED / END_TOO_LATE
+      slow end  -> ref end      => MATCHED / END_TOO_EARLY
+
+      slow start -> slow end, while ref inactive  => EXTRA
+      ref  start -> ref  end, while slow inactive => MISSING
+
+      slow end -> slow start, while ref active => SPLIT
+      ref  end -> ref  start, while slow active => MERGED
+
+    A same-kind cross-source boundary pair is considered MATCHED if the boundary
+    distance is <= timing_tolerance_m.
+    """
+    if len(events) < 2:
+        return []
+
+    issues: list[ThrottleBoundaryIssue] = []
+
+    # Active state in the open interval (e1.arc, e2.arc), after applying e1
+    ref_active = False
+    slow_active = False
+
+    for i in range(len(events) - 1):
+        e1 = events[i]
+        e2 = events[i + 1]
+
+        # Apply e1 so active flags describe the interval after e1
+        if e1.source == "ref":
+            ref_active = (e1.kind == "start")
+        else:
+            slow_active = (e1.kind == "start")
+
+        gap = float(e2.arc - e1.arc)
+        struct_gap_ok = gap >= min_struct_gap_m
+
+        # ------------------------------------------------------------
+        # Timing / matched boundaries:
+        # same-kind, different-source, sufficiently close in arc
+        # ------------------------------------------------------------
+        if e1.kind == e2.kind and e1.source != e2.source and gap <= timing_window_m:
+            is_matched = gap <= timing_tolerance_m
+
+            if e1.kind == "start":
+                if e1.source == "ref" and e2.source == "slow":
+                    issues.append(ThrottleBoundaryIssue(
+                        verdict=PlateauVerdict.MATCHED if is_matched else PlateauVerdict.START_TOO_LATE,
+                        ref=e1.plateau,
+                        slow=e2.plateau,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=gap,
+                        recommendation=(
+                            f"At ~{e1.arc:.0f} m your throttle start matches the reference "
+                            f"well (offset {gap:.1f} m)."
+                            if is_matched else
+                            f"At ~{e1.arc:.0f} m the reference starts throttle, but you start "
+                            f"at ~{e2.arc:.0f} m ({gap:.1f} m too late)."
+                        ),
+                    ))
+                elif e1.source == "slow" and e2.source == "ref":
+                    issues.append(ThrottleBoundaryIssue(
+                        verdict=PlateauVerdict.MATCHED if is_matched else PlateauVerdict.START_TOO_EARLY,
+                        ref=e2.plateau,
+                        slow=e1.plateau,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=-gap,
+                        recommendation=(
+                            f"At ~{e2.arc:.0f} m your throttle start matches the reference "
+                            f"well (offset {-gap:.1f} m)."
+                            if is_matched else
+                            f"You start throttle at ~{e1.arc:.0f} m, before the reference "
+                            f"start at ~{e2.arc:.0f} m ({gap:.1f} m too early)."
+                        ),
+                    ))
+
+            else:  # end/end
+                if e1.source == "ref" and e2.source == "slow":
+                    issues.append(ThrottleBoundaryIssue(
+                        verdict=PlateauVerdict.MATCHED if is_matched else PlateauVerdict.END_TOO_LATE,
+                        ref=e1.plateau,
+                        slow=e2.plateau,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=gap,
+                        recommendation=(
+                            f"At ~{e1.arc:.0f} m your throttle end matches the reference "
+                            f"well (offset {gap:.1f} m)."
+                            if is_matched else
+                            f"At ~{e1.arc:.0f} m the reference ends throttle, but you stay on "
+                            f"until ~{e2.arc:.0f} m ({gap:.1f} m too late)."
+                        ),
+                    ))
+                elif e1.source == "slow" and e2.source == "ref":
+                    issues.append(ThrottleBoundaryIssue(
+                        verdict=PlateauVerdict.MATCHED if is_matched else PlateauVerdict.END_TOO_EARLY,
+                        ref=e2.plateau,
+                        slow=e1.plateau,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=-gap,
+                        recommendation=(
+                            f"At ~{e2.arc:.0f} m your throttle end matches the reference "
+                            f"well (offset {-gap:.1f} m)."
+                            if is_matched else
+                            f"You end throttle at ~{e1.arc:.0f} m, before the reference "
+                            f"end at ~{e2.arc:.0f} m ({gap:.1f} m too early)."
+                        ),
+                    ))
+
+        # ------------------------------------------------------------
+        # Structural mismatches: adjacent same-source events
+        # ------------------------------------------------------------
+        if e1.source == e2.source and struct_gap_ok:
+            # source start -> source end
+            if e1.kind == "start" and e2.kind == "end":
+                if e1.source == "slow" and not ref_active:
+                    issues.append(ThrottleBoundaryIssue(
+                        verdict=PlateauVerdict.EXTRA,
+                        ref=None,
+                        slow=e1.plateau,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=None,
+                        recommendation=(
+                            f"Between {e1.arc:.0f}–{e2.arc:.0f} m you apply throttle, "
+                            f"but the reference does not."
+                        ),
+                    ))
+                elif e1.source == "ref" and not slow_active:
+                    issues.append(ThrottleBoundaryIssue(
+                        verdict=PlateauVerdict.MISSING,
+                        ref=e1.plateau,
+                        slow=None,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=None,
+                        recommendation=(
+                            f"Between {e1.arc:.0f}–{e2.arc:.0f} m the reference applies "
+                            f"throttle, but you do not."
+                        ),
+                    ))
+
+            # source end -> source start
+            elif e1.kind == "end" and e2.kind == "start":
+                if e1.source == "slow" and ref_active:
+                    issues.append(ThrottleBoundaryIssue(
+                        verdict=PlateauVerdict.SPLIT,
+                        ref=None,
+                        slow=e2.plateau,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=None,
+                        recommendation=(
+                            f"Between {e1.arc:.0f}–{e2.arc:.0f} m you lift and reapply "
+                            f"throttle, while the reference stays on throttle."
+                        ),
+                    ))
+                elif e1.source == "ref" and slow_active:
+                    issues.append(ThrottleBoundaryIssue(
+                        verdict=PlateauVerdict.MERGED,
+                        ref=e2.plateau,
+                        slow=None,
+                        arc_start=e1.arc,
+                        arc_end=e2.arc,
+                        offset_m=None,
+                        recommendation=(
+                            f"Between {e1.arc:.0f}–{e2.arc:.0f} the reference lifts and "
+                            f"reapplies throttle, but you stay on throttle continuously."
+                        ),
+                    ))
+
+    return issues
+
+_ISSUE_ICONS = {
+    PlateauVerdict.MATCHED: "✅",
+    PlateauVerdict.START_TOO_LATE: "⚠️ ",
+    PlateauVerdict.START_TOO_EARLY: "⚠️ ",
+    PlateauVerdict.END_TOO_LATE: "⚠️ ",
+    PlateauVerdict.END_TOO_EARLY: "⚠️ ",
+    PlateauVerdict.LEVEL_TOO_LOW: "⚠️ ",
+    PlateauVerdict.LEVEL_TOO_HIGH: "⚠️ ",
+    PlateauVerdict.MISSING: "❌",
+    PlateauVerdict.EXTRA: "⚠️ ",
+    PlateauVerdict.SPLIT: "⚠️ ",
+    PlateauVerdict.MERGED: "⚠️ ",
+}
+
 
 
 # ---------------------------------------------------------------------------
-# Console report
+# Gas level analysis inside plateaus
 # ---------------------------------------------------------------------------
 
-_APP_ICONS = {
-    AppVerdict.ON_TIME:   "✅",
-    AppVerdict.TOO_LATE:  "⚠️ ",
-    AppVerdict.TOO_EARLY: "⚠️ ",
-    AppVerdict.MISSING:   "❌",
-}
-
-_PLAT_ICONS = {
-    PlateauVerdict.MATCHED:      "✅",
-    PlateauVerdict.LATE_START:   "⚠️ ",
-    PlateauVerdict.EARLY_LIFT:   "⚠️ ",
-    PlateauVerdict.UNDER_COMMIT: "⚠️ ",
-    PlateauVerdict.MISSING:      "❌",
-}
+@dataclass
+class ThrottleLevelIssue:
+    verdict: PlateauVerdict   # LEVEL_TOO_LOW or LEVEL_TOO_HIGH
+    arc_start: float
+    arc_end: float
+    mean_delta: float         # slow_gas - ref_gas over the region
+    recommendation: str
 
 
-def print_gas_recommendations(
-    app_matches: list[ThrottleAppMatch],
-    plat_matches: list[ThrottlePlateauMatch],
-) -> None:
-    print("\n" + "=" * 60)
-    print("  GAS — Throttle Application Timing")
-    print("=" * 60)
-    for m in app_matches:
-        icon = _APP_ICONS.get(m.verdict, "?")
-        print(f"  {icon}  {m.recommendation}")
+def _merge_level_regions(
+    regions: list[tuple[float, float, str, float]],
+    *,
+    merge_gap_m: float,
+) -> list[tuple[float, float, str, float]]:
+    """
+    Merge adjacent same-label regions separated by a small gap.
 
-    print("\n" + "=" * 60)
-    print("  GAS — Full-Throttle Plateau Comparison")
-    print("=" * 60)
-    for m in plat_matches:
-        icon = _PLAT_ICONS.get(m.verdict, "?")
-        print(f"  {icon}  {m.recommendation}")
+    Each region is:
+        (start_arc, end_arc, label, mean_delta)
+    where label is "low" or "high".
+    """
+    if not regions:
+        return []
+
+    merged = [regions[0]]
+
+    for s, e, label, mean_delta in regions[1:]:
+        prev_s, prev_e, prev_label, prev_mean = merged[-1]
+        gap = s - prev_e
+
+        if label == prev_label and gap <= merge_gap_m:
+            # Weighted average by region length
+            prev_len = max(prev_e - prev_s, 1e-9)
+            curr_len = max(e - s, 1e-9)
+            new_mean = (prev_mean * prev_len + mean_delta * curr_len) / (prev_len + curr_len)
+            merged[-1] = (prev_s, e, label, new_mean)
+        else:
+            merged.append((s, e, label, mean_delta))
+
+    return merged
+
+
+def analyze_throttle_levels_in_mutual_plateaus(
+    ref_states: list,
+    slow_states: list,
+    events: list[PlateauBoundaryEvent],
+    *,
+    gas_tolerance: float = 0.08,
+    min_region_m: float = 5.0,
+    merge_gap_m: float = 3.0,
+) -> list[ThrottleLevelIssue]:
+    """
+    Analyze throttle level inside regions where BOTH laps are applying throttle.
+
+    Procedure
+    ---------
+    1. Build one sorted boundary-event list from both laps.
+    2. Sweep adjacent event pairs.
+    3. Whenever the open interval between two adjacent events has both ref and slow
+       throttle active, that interval is a mutual-throttle region.
+    4. Inside that region, compare slow gas against ref gas on a common arc grid
+       (union of ref and slow sample arcs, with interpolation).
+    5. Split the region into contiguous subregions where slow gas is:
+         - too low  (slow - ref < -gas_tolerance)
+         - too high (slow - ref > +gas_tolerance)
+       and ignore matched parts.
+    """
+    if len(events) < 2:
+        return []
+
+    ref_arc = np.array([s.arc for s in ref_states], dtype=float)
+    ref_gas = np.array([s.gas for s in ref_states], dtype=float)
+    slow_arc = np.array([s.arc for s in slow_states], dtype=float)
+    slow_gas = np.array([s.gas for s in slow_states], dtype=float)
+
+    issues: list[ThrottleLevelIssue] = []
+
+    ref_active = False
+    slow_active = False
+
+    for i in range(len(events) - 1):
+        e1 = events[i]
+        e2 = events[i + 1]
+
+        # Apply e1 so the flags describe the interval (e1.arc, e2.arc)
+        if e1.source == "ref":
+            ref_active = (e1.kind == "start")
+        else:
+            slow_active = (e1.kind == "start")
+
+        region_start = float(e1.arc)
+        region_end = float(e2.arc)
+
+        if region_end <= region_start:
+            continue
+
+        # Only analyze regions where both are on throttle
+        if not (ref_active and slow_active):
+            continue
+
+        # Build common comparison grid inside this mutual-throttle interval
+        ref_mask = (ref_arc >= region_start) & (ref_arc <= region_end)
+        slow_mask = (slow_arc >= region_start) & (slow_arc <= region_end)
+
+        grid = np.concatenate([
+            np.array([region_start, region_end], dtype=float),
+            ref_arc[ref_mask],
+            slow_arc[slow_mask],
+        ])
+        grid = np.unique(np.sort(grid))
+
+        # Need at least one segment
+        if len(grid) < 2:
+            continue
+
+        # Compare on interval midpoints rather than just nodes
+        mids = 0.5 * (grid[:-1] + grid[1:])
+        ref_mid = np.interp(mids, ref_arc, ref_gas)
+        slow_mid = np.interp(mids, slow_arc, slow_gas)
+        delta_mid = slow_mid - ref_mid
+
+        # Label each small segment
+        segment_labels: list[str] = []
+        for d in delta_mid:
+            if d < -gas_tolerance:
+                segment_labels.append("low")
+            elif d > gas_tolerance:
+                segment_labels.append("high")
+            else:
+                segment_labels.append("matched")
+
+        # Convert contiguous low/high segments into regions
+        raw_regions: list[tuple[float, float, str, float]] = []
+        curr_label = None
+        curr_start = None
+        curr_deltas: list[float] = []
+
+        for j, label in enumerate(segment_labels):
+            seg_start = float(grid[j])
+            seg_end = float(grid[j + 1])
+
+            if label == "matched":
+                if curr_label is not None:
+                    raw_regions.append((
+                        curr_start,
+                        seg_start,
+                        curr_label,
+                        float(np.mean(curr_deltas)),
+                    ))
+                    curr_label = None
+                    curr_start = None
+                    curr_deltas = []
+                continue
+
+            if curr_label is None:
+                curr_label = label
+                curr_start = seg_start
+                curr_deltas = [float(delta_mid[j])]
+            elif curr_label == label:
+                curr_deltas.append(float(delta_mid[j]))
+            else:
+                raw_regions.append((
+                    curr_start,
+                    seg_start,
+                    curr_label,
+                    float(np.mean(curr_deltas)),
+                ))
+                curr_label = label
+                curr_start = seg_start
+                curr_deltas = [float(delta_mid[j])]
+
+        if curr_label is not None:
+            raw_regions.append((
+                curr_start,
+                float(grid[-1]),
+                curr_label,
+                float(np.mean(curr_deltas)),
+            ))
+
+        # Merge nearby same-sign regions across tiny matched gaps
+        merged_regions = _merge_level_regions(raw_regions, merge_gap_m=merge_gap_m)
+
+        # Filter by size and create recommendations
+        for s, e, label, mean_delta in merged_regions:
+            duration = e - s
+            if duration < min_region_m:
+                continue
+
+            if label == "low":
+                issues.append(ThrottleLevelIssue(
+                    verdict=PlateauVerdict.LEVEL_TOO_LOW,
+                    arc_start=s,
+                    arc_end=e,
+                    mean_delta=mean_delta,
+                    recommendation=(
+                        f"Between {s:.0f}–{e:.0f} m you should apply more gas "
+                        f"(your throttle is lower than the reference by about "
+                        f"{abs(mean_delta):.0%} on average)."
+                    ),
+                ))
+            elif label == "high":
+                issues.append(ThrottleLevelIssue(
+                    verdict=PlateauVerdict.LEVEL_TOO_HIGH,
+                    arc_start=s,
+                    arc_end=e,
+                    mean_delta=mean_delta,
+                    recommendation=(
+                        f"Between {s:.0f}–{e:.0f} m you should apply less gas "
+                        f"(your throttle is higher than the reference by about "
+                        f"{abs(mean_delta):.0%} on average)."
+                    ),
+                ))
+
+    return issues
+
 
 
 # ---------------------------------------------------------------------------
-# Plotting helpers (callable from lap_analysis.py)
+# Printing
 # ---------------------------------------------------------------------------
 
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 
-_APP_COLORS = {
-    AppVerdict.ON_TIME:   "#2ecc71",
-    AppVerdict.TOO_LATE:  "#e74c3c",
-    AppVerdict.TOO_EARLY: "#f1c40f",
-    AppVerdict.MISSING:   "#95a5a6",
-}
+def print_gas_recommendations(boundary_issues: list[ThrottleBoundaryIssue], level_issues: list[ThrottleLevelIssue]) -> None:
+    print("\n" + "=" * 64)
+    print("  GAS — Boundary Analysis")
+    print("=" * 64)
+    for issue in boundary_issues:
+        icon = _ISSUE_ICONS.get(issue.verdict, "?")
+        print(f"  {icon}  {issue.recommendation}")
 
-_PLAT_COLORS = {
-    PlateauVerdict.MATCHED:      "#2ecc71",
-    PlateauVerdict.LATE_START:   "#e74c3c",
-    PlateauVerdict.EARLY_LIFT:   "#e67e22",
-    PlateauVerdict.UNDER_COMMIT: "#f1c40f",
-    PlateauVerdict.MISSING:      "#95a5a6",
-}
+    print("\n" + "=" * 64)
+    print("  GAS — Throttle Level Inside Mutual Plateaus")
+    print("=" * 64)
+    for issue in level_issues:
+        icon = "⚠️ " if issue.verdict in {PlateauVerdict.LEVEL_TOO_LOW, PlateauVerdict.LEVEL_TOO_HIGH} else "✅"
+        print(f"  {icon}  {issue.recommendation}")
+
 
 
 def plot_gas_analysis(
     ref_states: list,
     slow_states: list,
-    ref_arc: np.ndarray,
-    slow_arc: np.ndarray,
-    app_matches: list[ThrottleAppMatch],
-    plat_matches: list[ThrottlePlateauMatch],
-    ref_apps: list[ThrottleApplication],
-    slow_apps: list[ThrottleApplication],
     ref_plateaus: list[ThrottlePlateau],
     slow_plateaus: list[ThrottlePlateau],
+    boundary_issues: list[ThrottleBoundaryIssue],
+    level_issues: list[ThrottleLevelIssue],
     save_path: str | None = None,
 ) -> None:
     """
-    Two-panel gas plot:
-      Top:    Raw traces + throttle-application rising-edge markers
-      Bottom: Raw traces + full-throttle plateau bands
+    Two-panel gas plot using aligned CarState.arc.
+
+    Top panel:
+      - raw gas traces
+      - reference / slow plateau spans
+      - timing arrows for early/late/matched start/end boundaries
+
+    Bottom panel:
+      - structural mismatch regions (missing / extra / split / merged)
+      - level mismatch regions inside mutual plateaus
     """
-    ref_gas  = np.array([s.gas for s in ref_states])
-    slow_gas = np.array([s.gas for s in slow_states])
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
 
-    # Sort slow-lap data by mapped x-coordinate to prevent vertical spikes
-    slow_order = np.argsort(slow_arc, kind="stable")
-    slow_arc_sorted = slow_arc[slow_order]
-    slow_gas_sorted = np.array([s.gas for s in slow_states])[slow_order]
+    ref_arc = np.array([s.arc for s in ref_states], dtype=float)
+    slow_arc = np.array([s.arc for s in slow_states], dtype=float)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 8), sharex=False)
+    ref_gas = np.array([s.gas for s in ref_states], dtype=float)
+    slow_gas = np.array([s.gas for s in slow_states], dtype=float)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 9), sharex=False)
     fig.suptitle("Gas / Throttle Analysis", fontsize=13, fontweight="bold")
 
+    # ------------------------------------------------------------------
+    # Common trace plotting
+    # ------------------------------------------------------------------
     for ax in (ax1, ax2):
-        ax.plot(ref_arc,  ref_gas,  color="#2980b9", lw=1.4, label="Reference (fast)", zorder=3)
-        ax.plot(slow_arc_sorted, slow_gas_sorted, color="#e67e22", lw=1.4, alpha=0.85, label="Slow lap", zorder=3)
+        ax.plot(ref_arc, ref_gas, color="#2980b9", lw=1.5, label="Reference (fast)", zorder=3)
+        ax.plot(slow_arc, slow_gas, color="#e67e22", lw=1.4, alpha=0.9, label="Slow lap", zorder=3)
         ax.set_ylabel("Gas (0–1)", fontsize=9)
         ax.set_xlabel("Arc-length (m)", fontsize=9)
         ax.grid(True, alpha=0.3)
-        ax.set_ylim(-0.05, 1.15)
+        ax.set_ylim(-0.08, 1.20)
 
-    # --- Top panel: rising-edge (application) events ---
-    ax1.set_title("Throttle Application Timing  (▶ = commit point)", fontsize=10, loc="left")
+    # ------------------------------------------------------------------
+    # Top panel: plateaus + timing offsets
+    # ------------------------------------------------------------------
+    ax1.set_title("Throttle Plateaus and Boundary Timing", fontsize=10, loc="left")
 
-    for m in app_matches:
-        color = _APP_COLORS[m.verdict]
-        # Vertical line at reference commit point
-        ax1.axvline(m.ref.arc_pos, color=color, lw=1.5, alpha=0.8, zorder=4)
-        ax1.plot(m.ref.arc_pos, m.ref.peak_value, "v", color=color, ms=9, zorder=5,
-                 label=f"Ref commit ({m.verdict.name})")
-        if m.slow is not None:
-            ax1.plot(m.slow.arc_pos, m.slow.peak_value, "^", color="#e67e22",
-                     ms=8, zorder=5)
-            # Arrow showing the offset
-            ax1.annotate(
-                "",
-                xy=(m.slow.arc_pos, 1.05),
-                xytext=(m.ref.arc_pos, 1.05),
-                arrowprops=dict(
-                    arrowstyle="->",
-                    color=color,
-                    lw=1.5,
-                    connectionstyle="arc3,rad=0.0",
-                ),
-                zorder=6,
-            )
-            mid = (m.ref.arc_pos + m.slow.arc_pos) / 2
-            ax1.text(mid, 1.08, f"{m.offset_m:+.0f} m", ha="center",
-                     fontsize=7, color=color, zorder=7)
-
-    legend_els = [
-        mpatches.Patch(color="#2980b9", label="Reference"),
-        mpatches.Patch(color="#e67e22", label="Slow lap"),
-        plt.Line2D([0], [0], marker="v", color="w", markerfacecolor="#2ecc71", ms=9, label="On time"),
-        plt.Line2D([0], [0], marker="v", color="w", markerfacecolor="#e74c3c", ms=9, label="Too late"),
-        plt.Line2D([0], [0], marker="v", color="w", markerfacecolor="#f1c40f", ms=9, label="Too early"),
-        plt.Line2D([0], [0], marker="v", color="w", markerfacecolor="#95a5a6", ms=9, label="Missing"),
-    ]
-    ax1.legend(handles=legend_els, fontsize=7.5, loc="upper right", ncol=3)
-
-    # --- Bottom panel: plateau bands ---
-    ax2.set_title("Full-Throttle Plateaus  (shaded regions)", fontsize=10, loc="left")
-
+    # Background plateau spans
     for p in ref_plateaus:
-        ax2.axvspan(p.start_arc, p.end_arc, alpha=0.18, color="#2980b9", zorder=1)
+        ax1.axvspan(p.start_arc, p.end_arc, alpha=0.14, color="#2980b9", zorder=1)
+        ax1.plot(p.start_arc, 1.04, "v", color="#2980b9", ms=7, zorder=5)
+        ax1.plot(p.end_arc, 1.04, "s", color="#2980b9", ms=5, zorder=5)
 
     for p in slow_plateaus:
-        ax2.axvspan(p.start_arc, p.end_arc, alpha=0.18, color="#e67e22", zorder=1)
+        ax1.axvspan(p.start_arc, p.end_arc, alpha=0.14, color="#e67e22", zorder=1)
+        ax1.plot(p.start_arc, 0.98, "^", color="#e67e22", ms=7, zorder=5)
+        ax1.plot(p.end_arc, 0.98, "o", color="#e67e22", ms=5, zorder=5)
 
-    for m in plat_matches:
-        color = _PLAT_COLORS[m.verdict]
-        # Mark reference plateau start with a triangle
-        ypos = 1.02
-        ax2.plot(m.ref.start_arc, ypos, "v", color="#2980b9", ms=9, zorder=5)
-        if m.slow is not None:
-            ax2.plot(m.slow.start_arc, ypos, "^", color="#e67e22", ms=8, zorder=5)
-            if abs(m.start_offset_m) > 5:
-                ax2.annotate(
-                    "",
-                    xy=(m.slow.start_arc, ypos),
-                    xytext=(m.ref.start_arc, ypos),
-                    arrowprops=dict(arrowstyle="->", color=color, lw=1.5),
-                    zorder=6,
-                )
+    # Timing issue styling
+    timing_colors = {
+        PlateauVerdict.MATCHED: "#2ecc71",
+        PlateauVerdict.START_TOO_LATE: "#e74c3c",
+        PlateauVerdict.START_TOO_EARLY: "#f1c40f",
+        PlateauVerdict.END_TOO_LATE: "#c0392b",
+        PlateauVerdict.END_TOO_EARLY: "#f39c12",
+    }
 
-    legend_els2 = [
-        mpatches.Patch(color="#2980b9", alpha=0.4, label="Reference plateau"),
-        mpatches.Patch(color="#e67e22", alpha=0.4, label="Slow plateau"),
-        mpatches.Patch(color=_PLAT_COLORS[PlateauVerdict.MATCHED],      label="Matched"),
-        mpatches.Patch(color=_PLAT_COLORS[PlateauVerdict.LATE_START],   label="Late start"),
-        mpatches.Patch(color=_PLAT_COLORS[PlateauVerdict.EARLY_LIFT],   label="Early lift"),
-        mpatches.Patch(color=_PLAT_COLORS[PlateauVerdict.UNDER_COMMIT], label="Under-commit"),
-        mpatches.Patch(color=_PLAT_COLORS[PlateauVerdict.MISSING],      label="Missing"),
+    timing_verdicts = {
+        PlateauVerdict.MATCHED,
+        PlateauVerdict.START_TOO_LATE,
+        PlateauVerdict.START_TOO_EARLY,
+        PlateauVerdict.END_TOO_LATE,
+        PlateauVerdict.END_TOO_EARLY,
+    }
+
+    for issue in boundary_issues:
+        if issue.verdict not in timing_verdicts:
+            continue
+
+        color = timing_colors[issue.verdict]
+
+        # Start timing issues
+        if issue.verdict in {
+            PlateauVerdict.MATCHED,
+            PlateauVerdict.START_TOO_LATE,
+            PlateauVerdict.START_TOO_EARLY,
+        }:
+            if issue.ref is None or issue.slow is None:
+                continue
+
+            y = 1.11
+            ref_x = issue.ref.start_arc
+            slow_x = issue.slow.start_arc
+
+            ax1.plot(ref_x, y, "v", color="#2980b9", ms=8, zorder=7)
+            ax1.plot(slow_x, y, "^", color="#e67e22", ms=8, zorder=7)
+
+            ax1.annotate(
+                "",
+                xy=(slow_x, y),
+                xytext=(ref_x, y),
+                arrowprops=dict(arrowstyle="->", color=color, lw=1.5),
+                zorder=6,
+            )
+
+            mid = 0.5 * (ref_x + slow_x)
+            label = (
+                f"{issue.offset_m:+.0f} m"
+                if issue.offset_m is not None
+                else "0 m"
+            )
+            ax1.text(mid, y + 0.025, label, ha="center", fontsize=7, color=color, zorder=8)
+
+        # End timing issues
+        if issue.verdict in {
+            PlateauVerdict.MATCHED,
+            PlateauVerdict.END_TOO_LATE,
+            PlateauVerdict.END_TOO_EARLY,
+        }:
+            if issue.ref is None or issue.slow is None:
+                continue
+
+            y = 1.15
+            ref_x = issue.ref.end_arc
+            slow_x = issue.slow.end_arc
+
+            ax1.plot(ref_x, y, "s", color="#2980b9", ms=6, zorder=7)
+            ax1.plot(slow_x, y, "o", color="#e67e22", ms=6, zorder=7)
+
+            ax1.annotate(
+                "",
+                xy=(slow_x, y),
+                xytext=(ref_x, y),
+                arrowprops=dict(arrowstyle="->", color=color, lw=1.5),
+                zorder=6,
+            )
+
+            mid = 0.5 * (ref_x + slow_x)
+            label = (
+                f"{issue.offset_m:+.0f} m"
+                if issue.offset_m is not None
+                else "0 m"
+            )
+            ax1.text(mid, y + 0.02, label, ha="center", fontsize=7, color=color, zorder=8)
+
+    legend_top = [
+        mpatches.Patch(color="#2980b9", alpha=0.35, label="Reference plateau"),
+        mpatches.Patch(color="#e67e22", alpha=0.35, label="Slow plateau"),
+        plt.Line2D([0], [0], color="#2ecc71", lw=2, label="Boundary matched"),
+        plt.Line2D([0], [0], color="#e74c3c", lw=2, label="Start too late"),
+        plt.Line2D([0], [0], color="#f1c40f", lw=2, label="Start too early"),
+        plt.Line2D([0], [0], color="#c0392b", lw=2, label="End too late"),
+        plt.Line2D([0], [0], color="#f39c12", lw=2, label="End too early"),
     ]
-    ax2.legend(handles=legend_els2, fontsize=7.5, loc="upper right", ncol=3)
+    ax1.legend(handles=legend_top, fontsize=7.5, loc="upper right", ncol=3)
+
+    # ------------------------------------------------------------------
+    # Bottom panel: structural + level issues
+    # ------------------------------------------------------------------
+    ax2.set_title("Structure and Throttle-Level Mismatches", fontsize=10, loc="left")
+
+    # Show plateau spans faintly again for context
+    for p in ref_plateaus:
+        ax2.axvspan(p.start_arc, p.end_arc, alpha=0.06, color="#2980b9", zorder=1)
+    for p in slow_plateaus:
+        ax2.axvspan(p.start_arc, p.end_arc, alpha=0.06, color="#e67e22", zorder=1)
+
+    structure_colors = {
+        PlateauVerdict.MISSING: "#7f8c8d",
+        PlateauVerdict.EXTRA: "#34495e",
+        PlateauVerdict.SPLIT: "#8e44ad",
+        PlateauVerdict.MERGED: "#1abc9c",
+    }
+
+    # Plot structural issues as bold shaded regions
+    for issue in boundary_issues:
+        if issue.verdict not in structure_colors:
+            continue
+
+        color = structure_colors[issue.verdict]
+        ax2.axvspan(issue.arc_start, issue.arc_end, alpha=0.28, color=color, zorder=2)
+
+        mid = 0.5 * (issue.arc_start + issue.arc_end)
+        label_map = {
+            PlateauVerdict.MISSING: "missing",
+            PlateauVerdict.EXTRA: "extra",
+            PlateauVerdict.SPLIT: "split",
+            PlateauVerdict.MERGED: "merged",
+        }
+        ax2.text(
+            mid,
+            1.08,
+            label_map[issue.verdict],
+            ha="center",
+            va="center",
+            fontsize=7,
+            color=color,
+            zorder=5,
+        )
+
+    # Plot level issues as colored subregions inside mutual plateaus
+    level_colors = {
+        PlateauVerdict.LEVEL_TOO_LOW: "#9b59b6",
+        PlateauVerdict.LEVEL_TOO_HIGH: "#16a085",
+    }
+
+    for issue in level_issues:
+        if issue.verdict not in level_colors:
+            continue
+
+        color = level_colors[issue.verdict]
+        ax2.axvspan(issue.arc_start, issue.arc_end, ymin=0.05, ymax=0.92, alpha=0.22, color=color, zorder=3)
+
+        mid = 0.5 * (issue.arc_start + issue.arc_end)
+        short = "more gas" if issue.verdict == PlateauVerdict.LEVEL_TOO_LOW else "less gas"
+        ax2.text(
+            mid,
+            0.10,
+            short,
+            ha="center",
+            va="bottom",
+            fontsize=7,
+            color=color,
+            rotation=0,
+            zorder=6,
+        )
+
+    legend_bottom = [
+        mpatches.Patch(color=structure_colors[PlateauVerdict.MISSING], alpha=0.5, label="Missing plateau"),
+        mpatches.Patch(color=structure_colors[PlateauVerdict.EXTRA], alpha=0.5, label="Extra plateau"),
+        mpatches.Patch(color=structure_colors[PlateauVerdict.SPLIT], alpha=0.5, label="Split plateau"),
+        mpatches.Patch(color=structure_colors[PlateauVerdict.MERGED], alpha=0.5, label="Merged plateau"),
+        mpatches.Patch(color=level_colors[PlateauVerdict.LEVEL_TOO_LOW], alpha=0.4, label="Apply more gas"),
+        mpatches.Patch(color=level_colors[PlateauVerdict.LEVEL_TOO_HIGH], alpha=0.4, label="Apply less gas"),
+    ]
+    ax2.legend(handles=legend_bottom, fontsize=7.5, loc="upper right", ncol=3)
 
     plt.tight_layout()
     if save_path:
@@ -658,43 +948,63 @@ def plot_gas_analysis(
         plt.show()
 
 
-# ---------------------------------------------------------------------------
-# Entry point (standalone smoke test)
-# ---------------------------------------------------------------------------
+
 
 if __name__ == "__main__":
     import sys
-    from parser import LapDataParser, _arc_length, align_laps
+    from parser import LapDataParser, align_laps, filter_arc_jumps
 
     print("Loading reference (fast) lap …")
-    ref_states  = LapDataParser("data/hackathon/hackathon_fast_laps.mcap").get_lap_data()
+    ref_states = LapDataParser("data/hackathon/hackathon_fast_laps.mcap").get_lap_data()
 
     print("Loading slow lap …")
     slow_states = LapDataParser("data/hackathon/hackathon_good_lap.mcap").get_lap_data()
 
-    # slow_arc is expressed in reference metres — no independent arc calculation
-    ref_arc, slow_arc, _ = align_laps(ref_states, slow_states)
+    ref_states, slow_states = align_laps(ref_states, slow_states)
 
-    ref_apps  = detect_throttle_applications(ref_states,  ref_arc)
-    slow_apps = detect_throttle_applications(slow_states, slow_arc)
-    print(f"  Ref throttle applications:  {len(ref_apps)}")
-    print(f"  Slow throttle applications: {len(slow_apps)}")
+    ref_count = len(ref_states)
+    slow_count = len(slow_states)
 
-    ref_plats  = detect_throttle_plateaus(ref_states,  ref_arc)
-    slow_plats = detect_throttle_plateaus(slow_states, slow_arc)
-    print(f"  Ref full-throttle plateaus:  {len(ref_plats)}")
-    print(f"  Slow full-throttle plateaus: {len(slow_plats)}")
+    ref_states = filter_arc_jumps(ref_states)
+    slow_states = filter_arc_jumps(slow_states)
 
-    app_matches  = match_throttle_applications(ref_apps,  slow_apps)
-    plat_matches = match_throttle_plateaus(ref_plats, slow_plats)
+    print(f"{ref_count - len(ref_states)} ref points discarded")
+    print(f"{slow_count - len(slow_states)} slot points discarded")
 
-    print_gas_recommendations(app_matches, plat_matches)
+    ref_plateaus = detect_throttle_plateaus(ref_states)
+    slow_plateaus = detect_throttle_plateaus(slow_states)
+
+    print("Ref plateaus:")
+    for pl in ref_plateaus:
+        print(f"{pl.start_arc} - {pl.end_arc}")
+
+    print("Slow plateaus:")
+    for pl in slow_plateaus:
+        print(f"{pl.start_arc} - {pl.end_arc}")
+
+    events = _build_boundary_events(ref_plateaus, slow_plateaus)
+
+    boundary_issues = analyze_throttle_boundaries(
+        ref_plateaus,
+        slow_plateaus,
+        events,
+    )
+
+    level_issues = analyze_throttle_levels_in_mutual_plateaus(
+        ref_states,
+        slow_states,
+        events,
+    )
+
+    print_gas_recommendations(boundary_issues, level_issues)
 
     save = sys.argv[1] if len(sys.argv) > 1 else None
+
     plot_gas_analysis(
-        ref_states, slow_states, ref_arc, slow_arc,
-        app_matches, plat_matches,
-        ref_apps, slow_apps,
-        ref_plats, slow_plats,
-        save_path=save,
+        ref_states,
+        slow_states,
+        ref_plateaus,
+        slow_plateaus,
+        boundary_issues,
+        level_issues,
     )

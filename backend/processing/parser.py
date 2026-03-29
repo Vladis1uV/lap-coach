@@ -1,7 +1,7 @@
 """parser.py"""
 import math
 import pathlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from mcap_ros2.reader import read_ros2_messages
 import numpy as np
@@ -26,20 +26,26 @@ class CarState:
     brake: float
     gas: float
     speed: float      # hypot(vx, vy)
+    arc: float        # track-aligned arc-length s (m)
 
     @classmethod
     def from_state_estimation(cls, msg, timestamp_ns: int) -> "CarState":
         vx = getattr(msg, "vx_mps", 0.0)
         vy = getattr(msg, "vy_mps", 0.0)
+
+        idx = msg.sn_map_state.track_sn_state.sn_state.idx
+        ds = msg.sn_map_state.track_sn_state.sn_state.ds
+
         return cls(
             timestamp=timestamp_ns * 1e-9,
             x=msg.x_m,
             y=msg.y_m,
             z=msg.z_m,
             steering=msg.delta_wheel_rad,
-            brake=msg.brake,
+            brake=float(msg.brake) / float(5e6),
             gas=msg.gas,
             speed=math.hypot(vx, vy),
+            arc=float(idx)+ds,
         )
 
 
@@ -68,82 +74,172 @@ class LapDataParser:
 
 
 # ---------------------------------------------------------------------------
-# Arc-length for the REFERENCE lap only
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _arc_length(states: list[CarState]) -> np.ndarray:
-    """Cumulative 2-D arc-length (m) for a lap, starting at 0.
+def _rotate_list(xs: list[CarState], start_idx: int) -> list[CarState]:
+    """Cyclically rotate a list so xs[start_idx] becomes the first element."""
+    if not xs:
+        return []
+    start_idx %= len(xs)
+    return xs[start_idx:] + xs[:start_idx]
 
-    Only call this on the REFERENCE (fast) lap.
-    For the slow lap, use map_slow_to_ref() instead so its x-axis
-    is expressed purely as reference-point indices with no arc calculation.
+
+def _lap_length_from_arc(states: list[CarState]) -> float:
     """
-    n = len(states)
-    arc = np.zeros(n, dtype=float)
-    for i in range(1, n):
-        arc[i] = arc[i - 1] + math.hypot(
-            states[i].x - states[i - 1].x,
-            states[i].y - states[i - 1].y,
-        )
-    return arc
+    Estimate total lap length from the stored arc field.
+
+    Assumes `state.arc` is a lap-progress coordinate on one lap, typically in
+    [0, lap_length).  We use the maximum observed arc value as the lap length
+    proxy. If your data contains an explicit total lap length, use that instead.
+    """
+    if not states:
+        return 0.0
+    return max(float(s.arc) for s in states)
 
 
-# ---------------------------------------------------------------------------
-# Slow-lap → reference mapping  (no arc-length calculation)
-# ---------------------------------------------------------------------------
-
-def map_slow_to_ref(
-    slow_states: list[CarState],
-    ref_states:  list[CarState],
+def _normalize_arc_values(
+    states: list[CarState],
+    start_arc: float,
+    lap_length: float,
 ) -> np.ndarray:
-    """For every slow-lap point return the index of the nearest reference point.
-
-    The returned array is the x-axis for ALL slow-lap plots and event
-    detection.  It contains reference-point indices, not metres — no
-    arc-length is computed for the slow lap at any stage.
-
-    Shape: (len(slow_states),) dtype int
     """
-    ref_xy  = np.column_stack([[s.x for s in ref_states],  [s.y for s in ref_states]])
-    slow_xy = np.column_stack([[s.x for s in slow_states], [s.y for s in slow_states]])
-    tree = KDTree(ref_xy)
-    _, indices = tree.query(slow_xy)
-    return indices.astype(int)
+    Shift arc-lengths so `start_arc` becomes 0, wrapping cyclically by lap length.
 
-
-def slow_x_axis(
-    slow_to_ref: np.ndarray,
-    ref_arc:     np.ndarray,
-) -> np.ndarray:
-    """Convert the slow-lap index map to reference arc-length values.
-
-    Use this only for PLOTTING so the x-axis has readable metre labels.
-    Event detection (detect_brake_events etc.) should receive ref_arc[slow_to_ref]
-    directly — it is still derived from the mapping, never from slow-lap XY.
-
-    slow_x[i] = ref_arc[ slow_to_ref[i] ]
+    new_arc[i] = (states[i].arc - start_arc) mod lap_length
     """
-    return ref_arc[slow_to_ref]
+    if not states:
+        return np.array([], dtype=float)
 
+    if lap_length <= 0.0:
+        return np.zeros(len(states), dtype=float)
+
+    arc = np.array([float(s.arc) for s in states], dtype=float)
+    out = (arc - start_arc) % lap_length
+
+    # Make sure the chosen start really becomes 0 numerically
+    if len(out) > 0:
+        out[0] = 0.0
+
+    return out
+
+
+def _states_with_replaced_arc(
+    states: list[CarState],
+    new_arc: np.ndarray,
+) -> list[CarState]:
+    """Return copies of states with `arc` replaced by values from new_arc."""
+    return [replace(s, arc=float(a)) for s, a in zip(states, new_arc)]
+
+
+def _closest_state_index(
+    query_state: CarState,
+    candidates: list[CarState],
+) -> int:
+    """Index of the candidate closest in XY to `query_state`."""
+    if not candidates:
+        raise ValueError("Cannot find closest state in an empty list.")
+
+    cand_xy = np.column_stack([[s.x for s in candidates], [s.y for s in candidates]])
+    tree = KDTree(cand_xy)
+    _, idx = tree.query([query_state.x, query_state.y])
+    return int(idx)
+
+
+# ---------------------------------------------------------------------------
+# Alignment using stored arc-length
+# ---------------------------------------------------------------------------
 
 def align_laps(
-    ref_states:  list[CarState],
+    ref_states: list[CarState],
     slow_states: list[CarState],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """One-stop setup for a ref / slow comparison.
+) -> tuple[list[CarState], list[CarState]]:
+    """
+    Align laps using the stored `arc` field inside each CarState.
+
+    Procedure
+    ---------
+    1. Treat ref_states[0] as the reference origin.
+    2. Normalize reference arcs so ref_states_aligned[0].arc == 0.
+    3. Find the slow-lap sample closest in XY to ref_states[0].
+    4. Rotate slow_states so that sample becomes index 0.
+    5. Normalize rotated slow arcs so slow_states_aligned[0].arc == 0.
 
     Returns
     -------
-    ref_arc      : arc-length for the reference lap (m), starting at 0
-    slow_arc     : slow-lap x-axis expressed in reference metres
-                   = ref_arc[ slow_to_ref[i] ]  — no independent calculation
-    slow_to_ref  : integer index array, slow_to_ref[i] is the reference index
-                   nearest to slow_states[i]
+    ref_states_aligned : list[CarState]
+        Reference states with arc shifted so the first state has arc 0.
+
+    slow_states_aligned : list[CarState]
+        Rotated slow states with arc shifted so the first state has arc 0.
     """
-    ref_arc    = _arc_length(ref_states)
-    slow_to_ref = map_slow_to_ref(slow_states, ref_states)
-    slow_arc   = slow_x_axis(slow_to_ref, ref_arc)
-    return ref_arc, slow_arc, slow_to_ref
+    if not ref_states:
+        raise ValueError("ref_states must not be empty.")
+    if not slow_states:
+        raise ValueError("slow_states must not be empty.")
+
+    ref_len = _lap_length_from_arc(ref_states)
+    slow_len = _lap_length_from_arc(slow_states)
+
+    # Normalize reference lap so its first sample is at arc = 0
+    ref_start_arc = float(ref_states[0].arc)
+    ref_arc_norm = _normalize_arc_values(ref_states, ref_start_arc, ref_len)
+    ref_states_aligned = _states_with_replaced_arc(ref_states, ref_arc_norm)
+
+    # Find slow sample closest to reference start, rotate slow lap
+    slow_start_idx = _closest_state_index(ref_states[0], slow_states)
+    slow_states_rot = _rotate_list(slow_states, slow_start_idx)
+
+    # Normalize rotated slow lap so its first sample is at arc = 0
+    slow_start_arc = float(slow_states_rot[0].arc)
+    slow_arc_norm = _normalize_arc_values(slow_states_rot, slow_start_arc, slow_len)
+    slow_states_aligned = _states_with_replaced_arc(slow_states_rot, slow_arc_norm)
+
+    return ref_states_aligned, slow_states_aligned
+
+
+def filter_arc_jumps(
+    states: list[CarState],
+    *,
+    max_jump_m: float = 20.0,
+) -> list[CarState]:
+    """
+    Remove states whose arc value jumps implausibly relative to the previous kept state.
+
+    Assumptions
+    -----------
+    - `states` are already aligned, rotated, and arc-normalized
+    - along a valid lap, consecutive arc values should change smoothly
+    - occasional corrupted samples may have arc values from a completely different
+      part of the track; these are discarded
+
+    Parameters
+    ----------
+    states : list[CarState]
+        Input states in temporal order.
+    max_jump_m : float
+        Maximum allowed absolute arc jump between consecutive kept samples.
+        If abs(curr.arc - prev_kept.arc) > max_jump_m, the sample is skipped.
+
+    Returns
+    -------
+    list[CarState]
+        Filtered list with corrupted arc-jump samples removed.
+    """
+    if not states:
+        return []
+
+    filtered = [states[0]]
+    prev = states[0]
+
+    for s in states[1:]:
+        jump = abs(float(s.arc) - float(prev.arc))
+        if jump <= max_jump_m:
+            filtered.append(s)
+            prev = s
+        # else: skip corrupted point
+
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -173,43 +269,6 @@ def match_lap_states(
     return [(source[i], target[j]) for i, j in index_map.items()]
 
 
-# ---------------------------------------------------------------------------
-# Delta helpers
-# ---------------------------------------------------------------------------
-
-@dataclass
-class PositionDelta:
-    source_idx: int
-    x: float
-    y: float
-    delta_gas: float
-    delta_brake: float
-    delta_steering: float
-    delta_speed: float
-
-
-def compute_deltas(
-    pairs: list[tuple[CarState, CarState]],
-    threshold_gas: float = 0.05,
-    threshold_brake: float = 0.05,
-    threshold_speed: float = 1.0,
-) -> list[PositionDelta]:
-    deltas: list[PositionDelta] = []
-    for i, (ours, best) in enumerate(pairs):
-        d_gas   = best.gas      - ours.gas
-        d_brake = best.brake    - ours.brake
-        d_steer = best.steering - ours.steering
-        d_speed = best.speed    - ours.speed
-        if (abs(d_gas) > threshold_gas
-                or abs(d_brake) > threshold_brake
-                or abs(d_speed) > threshold_speed):
-            deltas.append(PositionDelta(
-                source_idx=i, x=ours.x, y=ours.y,
-                delta_gas=d_gas, delta_brake=d_brake,
-                delta_steering=d_steer, delta_speed=d_speed,
-            ))
-    return deltas
-
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -219,9 +278,11 @@ if __name__ == "__main__":
     fast_states = LapDataParser("data/hackathon/hackathon_fast_laps.mcap").get_lap_data()
     good_states = LapDataParser("data/hackathon/hackathon_good_lap.mcap").get_lap_data()
 
-    ref_arc, slow_arc, slow_to_ref = align_laps(fast_states, good_states)
+    ref_arc, slow_arc, fast_states_aligned, good_states_aligned = align_laps(
+        fast_states,
+        good_states,
+    )
 
-    print(f"Fast samples : {len(fast_states)},  ref_arc 0 → {ref_arc[-1]:.1f} m")
-    print(f"Good samples : {len(good_states)}")
-    print(f"slow_arc (= ref positions): min={slow_arc.min():.1f}  max={slow_arc.max():.1f} m")
-    print(f"No arc-length was computed for the slow lap.")
+    print(f"Fast samples : {len(fast_states_aligned)}, ref_arc  0 → {ref_arc[-1]:.1f} m")
+    print(f"Good samples : {len(good_states_aligned)}, slow_arc 0 → {slow_arc[-1]:.1f} m")
+    print(f"Both laps now start at 0 m.")
