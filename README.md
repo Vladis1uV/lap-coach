@@ -5,10 +5,10 @@ A racing lap analysis tool that compares two MCAP telemetry recordings — a **f
 ## How It Works
 
 1. **Upload** two `.mcap` files via the web UI
-2. The **Python backend** parses telemetry data (throttle, brake, steering vs. arc position), aligns the laps, and runs three analysis modules:
-   - **Throttle analysis** — detects plateau boundaries and level differences
+2. The **Python backend** parses telemetry data (throttle, brake, steering vs. arc position), aligns the fast reference lap with the provided by position on the track, and runs three analysis modules:
+   - **Throttle analysis** — detects plateau boundaries and level differences of throttle application
    - **Brake analysis** — same approach for braking zones
-   - **Steering analysis** — identifies lateral offset patterns
+   - **Steering analysis** — identifies the differences of angle of steering 
 3. The backend returns a list of recommendations with verdicts (e.g. "brake earlier", "less throttle in this arc range")
 4. The **React frontend** displays results grouped by category
 
